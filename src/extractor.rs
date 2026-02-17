@@ -2715,19 +2715,19 @@ fn expand_ligatures(text: &str) -> String {
         text.to_string()
     };
 
-    if !text.contains('\u{FB00}')
-        && !text.contains('\u{FB01}')
-        && !text.contains('\u{FB02}')
-        && !text.contains('\u{FB03}')
-        && !text.contains('\u{FB04}')
-    {
-        return text;
+    let mut result = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\u{FB00}' => result.push_str("ff"),
+            '\u{FB01}' => result.push_str("fi"),
+            '\u{FB02}' => result.push_str("fl"),
+            '\u{FB03}' => result.push_str("ffi"),
+            '\u{FB04}' => result.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => result.push_str("st"),
+            _ => result.push(ch),
+        }
     }
-    text.replace('\u{FB00}', "ff")
-        .replace('\u{FB01}', "fi")
-        .replace('\u{FB02}', "fl")
-        .replace('\u{FB03}', "ffi")
-        .replace('\u{FB04}', "ffl")
+    result
 }
 
 /// Estimate the width of a text item, falling back to a character-count heuristic when width is 0.

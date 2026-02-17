@@ -522,6 +522,7 @@ fn to_markdown_from_lines_with_tables_and_images(
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    let mut prev_had_dot_leaders = false;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
 
@@ -703,7 +704,7 @@ fn to_markdown_from_lines_with_tables_and_images(
                 // 3. Not a new list item
                 let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
                 let y_ok = y_gap < base_size * 7.0;
-                x_ok && y_ok && !is_list_item(plain_trimmed)
+                x_ok && y_ok && !is_list_item(plain_trimmed) && !has_dot_leaders(plain_trimmed)
             } else {
                 false
             };
@@ -738,11 +739,17 @@ fn to_markdown_from_lines_with_tables_and_images(
         }
 
         // Regular text - join lines within same paragraph with space
+        let cur_dot_leaders = has_dot_leaders(plain_trimmed);
         if in_paragraph {
-            output.push(' ');
+            if cur_dot_leaders || prev_had_dot_leaders {
+                output.push('\n');
+            } else {
+                output.push(' ');
+            }
         }
         output.push_str(trimmed);
         in_paragraph = true;
+        prev_had_dot_leaders = cur_dot_leaders;
     }
 
     // Flush current page and any remaining pages with tables/images
@@ -810,6 +817,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    let mut prev_had_dot_leaders = false;
 
     for line in lines {
         // Page break
@@ -825,6 +833,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             prev_y = f32::MAX;
             in_list = false;
             last_list_x = None;
+            prev_had_dot_leaders = false;
 
             if options.include_page_numbers {
                 output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
@@ -910,7 +919,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 // 3. Not a new list item
                 let x_ok = curr_x >= list_x - 5.0 && curr_x <= list_x + 50.0;
                 let y_ok = y_gap < base_size * 7.0;
-                x_ok && y_ok && !is_list_item(plain_trimmed)
+                x_ok && y_ok && !is_list_item(plain_trimmed) && !has_dot_leaders(plain_trimmed)
             } else {
                 false
             };
@@ -945,11 +954,17 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         }
 
         // Regular text - join lines within same paragraph with space
+        let cur_dot_leaders = has_dot_leaders(plain_trimmed);
         if in_paragraph {
-            output.push(' ');
+            if cur_dot_leaders || prev_had_dot_leaders {
+                output.push('\n');
+            } else {
+                output.push(' ');
+            }
         }
         output.push_str(trimmed);
         in_paragraph = true;
+        prev_had_dot_leaders = cur_dot_leaders;
     }
 
     // Close final paragraph
@@ -1124,6 +1139,34 @@ fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
         .unwrap_or(12.0);
 
     FontStats { most_common_size }
+}
+
+/// Detect TOC-style lines that contain dot leaders (e.g., "Section Name .... 42").
+/// These lines should never be joined with adjacent lines into a paragraph.
+/// Handles both consecutive dots ("....") and spaced dots ("...   ...").
+fn has_dot_leaders(text: &str) -> bool {
+    // Consecutive dots (4+)
+    if text.contains("....") {
+        return true;
+    }
+    // Spaced dot leaders: "..." followed by whitespace and more dots
+    // Count occurrences of "..." (3+ dots) — if 2+ groups, it's a dot leader
+    let mut dot_groups = 0;
+    let mut consecutive_dots = 0;
+    for ch in text.chars() {
+        if ch == '.' {
+            consecutive_dots += 1;
+        } else {
+            if consecutive_dots >= 3 {
+                dot_groups += 1;
+            }
+            consecutive_dots = 0;
+        }
+    }
+    if consecutive_dots >= 3 {
+        dot_groups += 1;
+    }
+    dot_groups >= 2
 }
 
 /// Compute the Y-gap threshold for paragraph break detection.
