@@ -489,6 +489,16 @@ pub enum ItemType {
     Link(String),
 }
 
+/// A rectangle from a PDF `re` operator (cell boundary, border, etc.)
+#[derive(Debug, Clone)]
+pub struct PdfRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub page: u32,
+}
+
 /// A text item with position information
 #[derive(Debug, Clone)]
 pub struct TextItem {
@@ -887,6 +897,15 @@ pub fn extract_text_with_positions_pages<P: AsRef<Path>>(
     path: P,
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
+    let (items, _rects) = extract_text_with_positions_and_rects(path, page_filter)?;
+    Ok(items)
+}
+
+/// Extract text with positions and rectangles from a file.
+pub(crate) fn extract_text_with_positions_and_rects<P: AsRef<Path>>(
+    path: P,
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
     // Read the raw PDF bytes for ToUnicode extraction
     let pdf_bytes = std::fs::read(path.as_ref())?;
     crate::validate_pdf_bytes(&pdf_bytes)?;
@@ -906,6 +925,15 @@ pub fn extract_text_with_positions_mem_pages(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<Vec<TextItem>, PdfError> {
+    let (items, _rects) = extract_text_with_positions_mem_and_rects(buffer, page_filter)?;
+    Ok(items)
+}
+
+/// Extract text with positions and rectangles from memory buffer.
+pub(crate) fn extract_text_with_positions_mem_and_rects(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
     crate::validate_pdf_bytes(buffer)?;
     // Extract ToUnicode CMaps from raw PDF bytes
     let font_cmaps = FontCMaps::from_pdf_bytes(buffer);
@@ -914,12 +942,12 @@ pub fn extract_text_with_positions_mem_pages(
     extract_positioned_text_from_doc(&doc, &font_cmaps, page_filter)
 }
 
-/// Extract positioned text from loaded document
+/// Extract positioned text and rectangles from loaded document
 fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<Vec<TextItem>, PdfError> {
+) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
     // If raw byte scanning found no CMaps, populate from the document model.
     // This handles PDFs with compressed object streams where raw scanning fails.
     let mut font_cmaps_owned;
@@ -933,6 +961,7 @@ fn extract_positioned_text_from_doc(
 
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
+    let mut all_rects = Vec::new();
 
     for (page_num, &page_id) in pages.iter() {
         if let Some(filter) = page_filter {
@@ -940,15 +969,16 @@ fn extract_positioned_text_from_doc(
                 continue;
             }
         }
-        let items = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
+        let (items, rects) = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
         all_items.extend(items);
+        all_rects.extend(rects);
 
         // Extract hyperlinks from page annotations
         let links = extract_page_links(doc, page_id, *page_num);
         all_items.extend(links);
     }
 
-    Ok(all_items)
+    Ok((all_items, all_rects))
 }
 
 /// Populate FontCMaps from the lopdf document model for ToUnicode streams
@@ -1015,16 +1045,17 @@ fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
     ]
 }
 
-/// Extract text items from a single page
+/// Extract text items and rectangles from a single page
 fn extract_page_text_items(
     doc: &Document,
     page_id: ObjectId,
     page_num: u32,
     font_cmaps: &FontCMaps,
-) -> Result<Vec<TextItem>, PdfError> {
+) -> Result<(Vec<TextItem>, Vec<PdfRect>), PdfError> {
     use lopdf::content::Content;
 
     let mut items = Vec::new();
+    let mut rects: Vec<PdfRect> = Vec::new();
 
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
@@ -1252,8 +1283,8 @@ fn extract_page_text_items(
                         &font_encodings,
                         &encoding_cache,
                     ) {
-                        let rendered_size = effective_font_size(current_font_size, &text_matrix);
                         let combined = multiply_matrices(&text_matrix, &ctm);
+                        let rendered_size = effective_font_size(current_font_size, &combined);
                         let (x, y) = (combined[4], combined[5]);
                         let width = if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
@@ -1393,8 +1424,8 @@ fn extract_page_text_items(
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
-                            let rendered_size =
-                                effective_font_size(current_font_size, &text_matrix);
+                            let combined = multiply_matrices(&text_matrix, &ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())
@@ -1464,9 +1495,8 @@ fn extract_page_text_items(
                         &encoding_cache,
                     ) {
                         if !text.trim().is_empty() {
-                            let rendered_size =
-                                effective_font_size(current_font_size, &text_matrix);
                             let combined = multiply_matrices(&text_matrix, &ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined);
                             let (x, y) = (combined[4], combined[5]);
                             let base_font = font_base_names
                                 .get(&current_font)
@@ -1545,8 +1575,8 @@ fn extract_page_text_items(
                 if let Some(Some(at)) = marked_content_stack.pop() {
                     // Compute width from text matrix advancement during BDC..EMC
                     if let Some(start_tm) = actual_text_start_tm.take() {
-                        let rendered_size = effective_font_size(current_font_size, &start_tm);
                         let combined = multiply_matrices(&start_tm, &ctm);
+                        let rendered_size = effective_font_size(current_font_size, &combined);
                         let (x, y) = (combined[4], combined[5]);
                         // Width in device space from text matrix delta
                         let delta_ts = text_matrix[4] - start_tm[4];
@@ -1575,12 +1605,33 @@ fn extract_page_text_items(
                     suppress_glyph_extraction = marked_content_stack.iter().any(|a| a.is_some());
                 }
             }
+            "re" => {
+                // Rectangle operator: collect for table-grid detection
+                if op.operands.len() >= 4 {
+                    let rx = get_number(&op.operands[0]).unwrap_or(0.0);
+                    let ry = get_number(&op.operands[1]).unwrap_or(0.0);
+                    let rw = get_number(&op.operands[2]).unwrap_or(0.0);
+                    let rh = get_number(&op.operands[3]).unwrap_or(0.0);
+                    // Transform origin to device space
+                    let x_dev = rx * ctm[0] + ry * ctm[2] + ctm[4];
+                    let y_dev = rx * ctm[1] + ry * ctm[3] + ctm[5];
+                    let w_dev = rw * ctm[0];
+                    let h_dev = rh * ctm[3];
+                    rects.push(PdfRect {
+                        x: x_dev,
+                        y: y_dev,
+                        width: w_dev,
+                        height: h_dev,
+                        page: page_num,
+                    });
+                }
+            }
             _ => {}
         }
     }
 
     let items = merge_text_items(items);
-    Ok(items)
+    Ok((items, rects))
 }
 
 /// Merge adjacent single-character TextItems into words.
@@ -1898,8 +1949,8 @@ fn extract_form_xobject_text(
                         &font_encodings,
                         &encoding_cache,
                     ) {
-                        let rendered_size = effective_font_size(current_font_size, &text_matrix);
                         let combined = multiply_matrices(&text_matrix, parent_ctm);
+                        let rendered_size = effective_font_size(current_font_size, &combined);
                         let (x, y) = (combined[4], combined[5]);
                         let width = if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(&op.operands[0]) {
@@ -2043,8 +2094,8 @@ fn extract_form_xobject_text(
                             sub_items.push((current_text, sub_start_width_ts, total_width_ts));
                         }
                         if !sub_items.is_empty() {
-                            let rendered_size =
-                                effective_font_size(current_font_size, &text_matrix);
+                            let combined = multiply_matrices(&text_matrix, parent_ctm);
+                            let rendered_size = effective_font_size(current_font_size, &combined);
                             let base_font = font_base_names
                                 .get(&current_font)
                                 .map(|s| s.as_str())

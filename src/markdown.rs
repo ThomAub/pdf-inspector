@@ -117,8 +117,17 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
 
 /// Convert positioned text items to markdown with structure detection
 pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) -> String {
+    to_markdown_from_items_with_rects(items, options, &[])
+}
+
+/// Convert positioned text items to markdown, using rectangle data for table detection
+pub fn to_markdown_from_items_with_rects(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::extractor::PdfRect],
+) -> String {
     use crate::extractor::ItemType;
-    use crate::tables::{detect_tables, table_to_markdown};
+    use crate::tables::{detect_tables, detect_tables_from_rects, table_to_markdown};
     use std::collections::HashSet;
 
     if items.is_empty() {
@@ -193,24 +202,76 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
 
-        let tables = detect_tables(&page_items, base_size, false);
+        // Track which local indices are claimed by rect-based tables
+        let mut rect_claimed: HashSet<usize> = HashSet::new();
 
-        for table in tables {
-            // Mark items as belonging to a table using pre-computed global indices
+        // Try rectangle-based table detection first
+        let rect_tables = detect_tables_from_rects(&page_items, rects, page);
+        for table in &rect_tables {
             for &idx in &table.item_indices {
+                rect_claimed.insert(idx);
                 if let Some(&(global_idx, _)) = group.get(idx) {
                     table_items.insert(global_idx);
                 }
             }
-
-            // Get Y position for table insertion (use highest Y in table)
             let table_y = table.rows.first().copied().unwrap_or(0.0);
-            let table_md = table_to_markdown(&table);
-
+            let table_md = table_to_markdown(table);
             page_tables
                 .entry(page)
                 .or_default()
                 .push((table_y, table_md));
+        }
+
+        // Run heuristic detection on unclaimed items only
+        if rect_claimed.is_empty() {
+            // No rect tables — run heuristic on all items
+            let tables = detect_tables(&page_items, base_size, false);
+            for table in tables {
+                for &idx in &table.item_indices {
+                    if let Some(&(global_idx, _)) = group.get(idx) {
+                        table_items.insert(global_idx);
+                    }
+                }
+                let table_y = table.rows.first().copied().unwrap_or(0.0);
+                let table_md = table_to_markdown(&table);
+                page_tables
+                    .entry(page)
+                    .or_default()
+                    .push((table_y, table_md));
+            }
+        } else {
+            // Rect tables found — run heuristic on unclaimed items
+            let unclaimed_items: Vec<TextItem> = page_items
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !rect_claimed.contains(idx))
+                .map(|(_, item)| item.clone())
+                .collect();
+            if unclaimed_items.len() >= 6 {
+                let tables = detect_tables(&unclaimed_items, base_size, false);
+                for table in tables {
+                    // Remap indices from unclaimed-space back to page-space
+                    let unclaimed_map: Vec<usize> = page_items
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| !rect_claimed.contains(idx))
+                        .map(|(idx, _)| idx)
+                        .collect();
+                    for &idx in &table.item_indices {
+                        if let Some(&page_idx) = unclaimed_map.get(idx) {
+                            if let Some(&(global_idx, _)) = group.get(page_idx) {
+                                table_items.insert(global_idx);
+                            }
+                        }
+                    }
+                    let table_y = table.rows.first().copied().unwrap_or(0.0);
+                    let table_md = table_to_markdown(&table);
+                    page_tables
+                        .entry(page)
+                        .or_default()
+                        .push((table_y, table_md));
+                }
+            }
         }
     }
 

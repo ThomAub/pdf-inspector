@@ -17,9 +17,11 @@ pub use detector::{
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
 pub use extractor::{
-    extract_text, extract_text_with_positions, extract_text_with_positions_pages, TextItem,
+    extract_text, extract_text_with_positions, extract_text_with_positions_pages, PdfRect, TextItem,
 };
-pub use markdown::{to_markdown, to_markdown_from_items, MarkdownOptions};
+pub use markdown::{
+    to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
+};
 
 use std::path::Path;
 
@@ -66,8 +68,9 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
     let result = match pdf_type {
         PdfType::TextBased => {
             // Step 2: Full extraction with position-aware reading order
-            let items = extract_text_with_positions(&path)?;
-            let markdown = to_markdown_from_items(items, MarkdownOptions::default());
+            let (items, rects) = extractor::extract_text_with_positions_and_rects(&path, None)?;
+            let markdown =
+                to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects);
 
             PdfProcessResult {
                 pdf_type,
@@ -95,8 +98,10 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
         }
         PdfType::Mixed => {
             // Try to extract what we can with position-aware reading order
-            let items = extract_text_with_positions(&path).ok();
-            let markdown = items.map(|i| to_markdown_from_items(i, MarkdownOptions::default()));
+            let result = extractor::extract_text_with_positions_and_rects(&path, None).ok();
+            let markdown = result.map(|(items, rects)| {
+                to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects)
+            });
 
             PdfProcessResult {
                 pdf_type,
@@ -146,8 +151,9 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
 
     let result = match pdf_type {
         PdfType::TextBased => {
-            let items = extract_text_with_positions_pages(&path, page_filter)?;
-            let markdown = to_markdown_from_items(items, markdown_options);
+            let (items, rects) =
+                extractor::extract_text_with_positions_and_rects(&path, page_filter)?;
+            let markdown = to_markdown_from_items_with_rects(items, markdown_options, &rects);
 
             PdfProcessResult {
                 pdf_type,
@@ -171,8 +177,10 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
             confidence,
         },
         PdfType::Mixed => {
-            let items = extract_text_with_positions_pages(&path, page_filter).ok();
-            let markdown = items.map(|i| to_markdown_from_items(i, markdown_options.clone()));
+            let result = extractor::extract_text_with_positions_and_rects(&path, page_filter).ok();
+            let markdown = result.map(|(items, rects)| {
+                to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects)
+            });
 
             PdfProcessResult {
                 pdf_type,
@@ -207,8 +215,10 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
     let result = match pdf_type {
         PdfType::TextBased => {
             // Step 2: Full extraction with position-aware reading order
-            let items = extractor::extract_text_with_positions_mem(buffer)?;
-            let markdown = to_markdown_from_items(items, MarkdownOptions::default());
+            let (items, rects) =
+                extractor::extract_text_with_positions_mem_and_rects(buffer, None)?;
+            let markdown =
+                to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects);
 
             PdfProcessResult {
                 pdf_type,
@@ -232,8 +242,10 @@ pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
             confidence,
         },
         PdfType::Mixed => {
-            let items = extractor::extract_text_with_positions_mem(buffer).ok();
-            let markdown = items.map(|i| to_markdown_from_items(i, MarkdownOptions::default()));
+            let result = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
+            let markdown = result.map(|(items, rects)| {
+                to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects)
+            });
 
             PdfProcessResult {
                 pdf_type,
@@ -270,8 +282,9 @@ pub fn process_pdf_mem_with_config(
 
     let result = match pdf_type {
         PdfType::TextBased => {
-            let items = extractor::extract_text_with_positions_mem(buffer)?;
-            let markdown = to_markdown_from_items(items, markdown_options);
+            let (items, rects) =
+                extractor::extract_text_with_positions_mem_and_rects(buffer, None)?;
+            let markdown = to_markdown_from_items_with_rects(items, markdown_options, &rects);
 
             PdfProcessResult {
                 pdf_type,
@@ -295,8 +308,10 @@ pub fn process_pdf_mem_with_config(
             confidence,
         },
         PdfType::Mixed => {
-            let items = extractor::extract_text_with_positions_mem(buffer).ok();
-            let markdown = items.map(|i| to_markdown_from_items(i, markdown_options.clone()));
+            let result = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
+            let markdown = result.map(|(items, rects)| {
+                to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects)
+            });
 
             PdfProcessResult {
                 pdf_type,
