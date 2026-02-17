@@ -154,11 +154,6 @@ fn parse_simple_font_widths(
         widths.insert(code, w);
     }
 
-    // If space width wasn't found in the table, use a reasonable default
-    if space_width == 0 {
-        space_width = 250;
-    }
-
     // Determine units_scale: for Type3 fonts, use FontMatrix[0]; for others, use 1/1000
     let units_scale = if let Ok(fm) = font_dict.get(b"FontMatrix") {
         if let Some(arr) = resolve_array(doc, fm) {
@@ -177,6 +172,20 @@ fn parse_simple_font_widths(
     } else {
         0.001 // Standard 1000-unit system
     };
+
+    // If space width wasn't found in the table, estimate from font metrics.
+    // The default of 250 is calibrated for standard 1000-unit fonts (units_scale=0.001).
+    // For Type3 fonts with different coordinate systems, use average glyph width instead.
+    if space_width == 0 {
+        if !widths.is_empty() && (units_scale - 0.001).abs() > 0.0005 {
+            // Non-standard scale: estimate space as ~45% of average glyph width
+            let sum: u32 = widths.values().map(|&w| w as u32).sum();
+            let avg = sum as f32 / widths.len() as f32;
+            space_width = (avg * 0.45).max(1.0) as u16;
+        } else {
+            space_width = 250;
+        }
+    }
 
     Some(FontWidthInfo {
         widths,
@@ -1190,7 +1199,7 @@ fn extract_page_text_items(
                         let space_threshold = if let Some(font_info) = font_info {
                             let space_em = font_info.space_width as f32 * font_info.units_scale;
                             let threshold = space_em * 1000.0 * 0.4;
-                            threshold.clamp(80.0, 200.0)
+                            threshold.max(80.0)
                         } else {
                             120.0
                         };
@@ -1654,7 +1663,7 @@ fn extract_form_xobject_text(
                         let space_threshold = if let Some(fi) = font_info {
                             let space_em = fi.space_width as f32 * fi.units_scale;
                             let threshold = space_em * 1000.0 * 0.4;
-                            threshold.clamp(80.0, 200.0)
+                            threshold.max(80.0)
                         } else {
                             120.0
                         };
