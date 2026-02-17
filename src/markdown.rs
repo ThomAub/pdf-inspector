@@ -190,22 +190,6 @@ pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) ->
         let group = page_groups.get(&page).unwrap();
         let page_items: Vec<TextItem> = group.iter().map(|(_, item)| (*item).clone()).collect();
 
-        // Skip table detection on pages with clear multi-column text layout.
-        // Column detection in group_into_lines handles these correctly, and
-        // table detection would incorrectly claim columnar text as table rows.
-        // Only skip when all detected columns are wide (>120pt),
-        // indicating true text columns rather than narrow table columns.
-        let columns = crate::extractor::detect_columns(&page_items, page);
-        if columns.len() >= 2 {
-            let min_col_width = columns
-                .iter()
-                .map(|c| c.x_max - c.x_min)
-                .fold(f32::INFINITY, f32::min);
-            if min_col_width > 120.0 {
-                continue;
-            }
-        }
-
         let tables = detect_tables(&page_items, base_size, false);
 
         for table in tables {

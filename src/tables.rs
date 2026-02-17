@@ -578,6 +578,13 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         return None;
     }
 
+    // Validation 9: Reject paragraph-like content falsely detected as tables.
+    // Real table cells are short and self-contained. Paragraph text split into
+    // "cells" produces long sentence fragments.
+    if is_paragraph_content(&cells) {
+        return None;
+    }
+
     Some(Table {
         columns,
         rows,
@@ -822,6 +829,97 @@ fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
 
     // TOC typically has >15% dot cells and >10% page number cells
     dot_ratio > 0.15 || (dot_ratio > 0.05 && page_num_ratio > 0.15)
+}
+
+/// Check if detected "table" cells are actually paragraph text fragments.
+///
+/// Multi-column paragraph text falsely detected as tables produces:
+/// - Many empty cells (text doesn't span all columns)
+/// - Cells ending with hyphens (word breaks across "columns")
+/// - Long sentence fragments or single-word fragments
+fn is_paragraph_content(cells: &[Vec<String>]) -> bool {
+    if cells.is_empty() {
+        return false;
+    }
+
+    let num_cols = cells[0].len();
+    let total_cells = cells.len() * num_cols;
+    if total_cells == 0 {
+        return false;
+    }
+
+    let filled: Vec<&str> = cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    let total_filled = filled.len();
+    if total_filled < 4 {
+        return false;
+    }
+
+    let empty_ratio = 1.0 - (total_filled as f32 / total_cells as f32);
+
+    // Cells ending with a hyphen suggest word breaks across columns.
+    // Real table cells almost never end with hyphens (except range indicators).
+    let hyphen_breaks = filled
+        .iter()
+        .filter(|c| {
+            c.ends_with('-') && c.len() > 1 && {
+                let mut chars = c.chars().rev();
+                chars.next(); // skip the '-'
+                chars.next().is_some_and(|ch| ch.is_alphabetic())
+            }
+        })
+        .count();
+    let hyphen_ratio = hyphen_breaks as f32 / total_filled as f32;
+
+    // Word-break hyphens are a strong paragraph signal
+    if hyphen_ratio > 0.03 {
+        return true;
+    }
+
+    // High empty ratio with many rows suggests paragraph text spread across a grid
+    if empty_ratio > 0.55 && cells.len() > 10 {
+        return true;
+    }
+
+    // Letter-spaced text (spaces between every character) is never real table data.
+    // This happens when PDF uses wide character spacing for emphasis/formatting.
+    // Require at least 9 chars (e.g., "a b c d e") to avoid matching short codes.
+    let letter_spaced = filled
+        .iter()
+        .filter(|c| {
+            let chars: Vec<char> = c.chars().collect();
+            chars.len() >= 9
+                && chars.windows(4).all(|w| {
+                    (w[0].is_alphabetic() && w[1] == ' ' && w[2].is_alphabetic() && w[3] == ' ')
+                        || (w[0] == ' '
+                            && w[1].is_alphabetic()
+                            && w[2] == ' '
+                            && w[3].is_alphabetic())
+                })
+        })
+        .count();
+    if letter_spaced > 0 && letter_spaced as f32 / total_filled as f32 > 0.08 {
+        return true;
+    }
+
+    // Long sentence fragments
+    let long_cells = filled.iter().filter(|c| c.len() > 60).count();
+    let long_ratio = long_cells as f32 / total_filled as f32;
+    let avg_len = filled.iter().map(|c| c.len()).sum::<usize>() as f32 / total_filled as f32;
+
+    if avg_len > 40.0 && long_ratio > 0.2 {
+        return true;
+    }
+    if long_ratio > 0.3 {
+        return true;
+    }
+
+    false
 }
 
 /// Check what fraction of items align to detected columns
