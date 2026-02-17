@@ -138,6 +138,112 @@ fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>> {
     Some(sub_items)
 }
 
+/// Merge adjacent items on the same line into combined words/phrases.
+///
+/// Per-character PDFs render each glyph as a separate TextItem. This creates
+/// hundreds of single-char items that confuse column detection. This function
+/// merges adjacent items within the same line (similar Y, close X, similar font
+/// size) into multi-character items, similar to PyMuPDF's `merge_chars()`.
+///
+/// Returns `(merged_items, index_map)` where `index_map[merged_idx]` contains
+/// the original item indices that were merged into that item.
+fn merge_adjacent_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<Vec<usize>>) {
+    if items.is_empty() {
+        return (vec![], vec![]);
+    }
+
+    // Group items by Y position (5pt tolerance for same line)
+    let y_tolerance = 5.0;
+    let mut line_groups: Vec<(f32, Vec<(usize, &TextItem)>)> = Vec::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        let found = line_groups
+            .iter_mut()
+            .find(|(y, _)| (item.y - *y).abs() < y_tolerance);
+        if let Some((_, group)) = found {
+            group.push((idx, item));
+        } else {
+            line_groups.push((item.y, vec![(idx, item)]));
+        }
+    }
+
+    // Sort each group by X position
+    for (_, group) in &mut line_groups {
+        group.sort_by(|a, b| {
+            a.1.x
+                .partial_cmp(&b.1.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    // Sort groups by Y descending (top of page first)
+    line_groups.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut merged_items = Vec::new();
+    let mut index_map: Vec<Vec<usize>> = Vec::new();
+
+    for (_, group) in &line_groups {
+        let mut i = 0;
+        while i < group.len() {
+            let (first_idx, first_item) = group[i];
+            let mut text = first_item.text.clone();
+            let mut end_x = first_item.x + first_item.width;
+            let mut indices = vec![first_idx];
+            let x_gap_max = first_item.font_size * 0.5;
+
+            let mut j = i + 1;
+            while j < group.len() {
+                let (next_idx, next_item) = group[j];
+
+                // Must be similar font size (within 20%)
+                if (next_item.font_size - first_item.font_size).abs() > first_item.font_size * 0.20
+                {
+                    break;
+                }
+
+                let gap = next_item.x - end_x;
+                // Stop if gap exceeds threshold (inter-column gap)
+                if gap > x_gap_max {
+                    break;
+                }
+                // Stop on large overlap (different column overlapping)
+                if gap < -first_item.font_size * 0.5 {
+                    break;
+                }
+
+                // Insert space at word boundaries: within a word characters
+                // touch (gap ≈ 0), between words there's a visible gap.
+                if gap > first_item.font_size * 0.08 {
+                    text.push(' ');
+                }
+                text.push_str(&next_item.text);
+                end_x = next_item.x + next_item.width;
+                indices.push(next_idx);
+                j += 1;
+            }
+
+            merged_items.push(TextItem {
+                text,
+                x: first_item.x,
+                y: first_item.y,
+                width: end_x - first_item.x,
+                height: first_item.height,
+                font: first_item.font.clone(),
+                font_size: first_item.font_size,
+                page: first_item.page,
+                is_bold: first_item.is_bold,
+                is_italic: first_item.is_italic,
+                item_type: first_item.item_type.clone(),
+            });
+            index_map.push(indices);
+
+            i = j;
+        }
+    }
+
+    (merged_items, index_map)
+}
+
 /// Iterates all items, expanding qualifying consolidated financial items.
 /// Returns `(expanded_items, index_map)` where `index_map[expanded_idx] = original_idx`.
 fn expand_consolidated_items(items: &[TextItem]) -> (Vec<TextItem>, Vec<usize>) {
@@ -163,8 +269,12 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
         return vec![];
     }
 
-    let (expanded_items, index_map) = expand_consolidated_items(items);
-    let items = &expanded_items[..]; // shadow parameter — all detection uses expanded items
+    // Step 1: Merge adjacent single-char items into words (handles per-character PDFs)
+    let (merged_items, merge_map) = merge_adjacent_items(items);
+
+    // Step 2: Expand consolidated financial items (e.g. "$ 1,234 $ 5,678" → sub-items)
+    let (expanded_items, expand_map) = expand_consolidated_items(&merged_items);
+    let items = &expanded_items[..]; // shadow parameter — all detection uses processed items
 
     let mut tables = Vec::new();
     let mut claimed_indices = std::collections::HashSet::new();
@@ -247,10 +357,16 @@ pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bo
         }
     }
 
-    // Map expanded indices back to original item indices
+    // Map indices back: expanded → merged → original
     for table in &mut tables {
-        let original_indices: std::collections::HashSet<usize> =
-            table.item_indices.iter().map(|&i| index_map[i]).collect();
+        let original_indices: std::collections::HashSet<usize> = table
+            .item_indices
+            .iter()
+            .flat_map(|&exp_idx| {
+                let merged_idx = expand_map[exp_idx];
+                merge_map[merged_idx].iter().copied()
+            })
+            .collect();
         table.item_indices = original_indices.into_iter().collect();
         table.item_indices.sort_unstable();
     }
@@ -1820,5 +1936,126 @@ mod tests {
             "Each company must be on its own row, got {} rows instead of 8",
             tables[0].rows.len()
         );
+    }
+
+    #[test]
+    fn test_merge_adjacent_items() {
+        // Simulate per-character rendering: "June 30," as individual glyphs
+        let items = vec![
+            make_char("J", 310.0, 532.0, 13.3, 4.0),
+            make_char("u", 314.0, 532.0, 13.3, 4.4),
+            make_char("n", 318.4, 532.0, 13.3, 4.4),
+            make_char("e", 322.8, 532.0, 13.3, 3.5),
+            // word gap (2pt)
+            make_char("3", 328.3, 532.0, 13.3, 4.0),
+            make_char("0", 332.3, 532.0, 13.3, 4.0),
+            make_char(",", 336.3, 532.0, 13.3, 2.0),
+            // large column gap (40pt)
+            make_char("M", 378.3, 532.0, 13.3, 7.5),
+            make_char("a", 385.8, 532.0, 13.3, 4.0),
+            make_char("r", 389.8, 532.0, 13.3, 3.5),
+        ];
+
+        let (merged, map) = merge_adjacent_items(&items);
+
+        // "June 30," should merge into one item, "Mar" into another
+        assert_eq!(
+            merged.len(),
+            2,
+            "Should produce 2 merged items, got {}",
+            merged.len()
+        );
+        assert!(
+            merged[0].text.contains("June") && merged[0].text.contains("30"),
+            "First merged item should be 'June 30,' but got {:?}",
+            merged[0].text
+        );
+        assert_eq!(merged[1].text, "Mar");
+
+        // Index map should track original indices
+        assert_eq!(
+            map[0].len(),
+            7,
+            "First merged item should map to 7 original chars"
+        );
+        assert_eq!(
+            map[1].len(),
+            3,
+            "Second merged item should map to 3 original chars"
+        );
+    }
+
+    #[test]
+    fn test_per_char_financial_table_detected() {
+        // Simulates a financial table with per-character header rendering
+        // and multi-word data items (like SEC filing EBITDA table).
+        let mut items = Vec::new();
+
+        // Per-character header row: "Col1" at x≈300, "Col2" at x≈400, "Col3" at x≈500
+        for (i, c) in "Col1".chars().enumerate() {
+            items.push(make_char(
+                &c.to_string(),
+                300.0 + i as f32 * 5.0,
+                540.0,
+                13.0,
+                5.0,
+            ));
+        }
+        for (i, c) in "Col2".chars().enumerate() {
+            items.push(make_char(
+                &c.to_string(),
+                400.0 + i as f32 * 5.0,
+                540.0,
+                13.0,
+                5.0,
+            ));
+        }
+        for (i, c) in "Col3".chars().enumerate() {
+            items.push(make_char(
+                &c.to_string(),
+                500.0 + i as f32 * 5.0,
+                540.0,
+                13.0,
+                5.0,
+            ));
+        }
+
+        // Data rows with multi-word items (typical extraction output)
+        let data = [
+            ("Revenue", 520.0, "1,000", "2,000", "3,000"),
+            ("Expenses", 505.0, "500", "800", "1,200"),
+            ("Net Income", 490.0, "500", "1,200", "1,800"),
+            ("Taxes", 475.0, "100", "200", "300"),
+        ];
+
+        for (label, y, v1, v2, v3) in &data {
+            items.push(make_item(label, 50.0, *y, 12.0));
+            items.push(make_item(v1, 310.0, *y, 12.0));
+            items.push(make_item(v2, 410.0, *y, 12.0));
+            items.push(make_item(v3, 510.0, *y, 12.0));
+        }
+
+        let tables = detect_tables(&items, 13.0, false);
+        assert!(
+            !tables.is_empty(),
+            "Per-character financial table should be detected"
+        );
+    }
+
+    /// Helper to make a single-character TextItem with a specific width
+    fn make_char(text: &str, x: f32, y: f32, font_size: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.into(),
+            x,
+            y,
+            width,
+            height: font_size,
+            font: "F1".into(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: crate::extractor::ItemType::Text,
+        }
     }
 }
