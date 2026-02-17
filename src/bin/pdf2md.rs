@@ -90,8 +90,10 @@ fn main() {
         .filter(|a| !a.starts_with("--"))
         .map(|s| s.as_str());
 
-    let mut md_options = MarkdownOptions::default();
-    md_options.include_page_numbers = page_numbers;
+    let md_options = MarkdownOptions {
+        include_page_numbers: page_numbers,
+        ..Default::default()
+    };
 
     match process_pdf_with_config_pages(
         pdf_path,
