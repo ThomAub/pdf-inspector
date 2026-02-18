@@ -2851,12 +2851,20 @@ pub(crate) fn detect_columns(items: &[TextItem], page: u32) -> Vec<ColumnRegion>
         return vec![ColumnRegion { x_min, x_max }];
     }
 
-    // Build occupancy histogram
+    // Build occupancy histogram.
+    // Exclude items wider than 60% of page width — these are spanning items
+    // (titles, full-width paragraphs) that would fill the gutter and prevent
+    // detection of partial-page column layouts (e.g. two-column abstracts on
+    // a page that also has single-column introduction text).
+    let wide_threshold = page_width * 0.6;
     let num_bins = ((page_width / BIN_WIDTH).ceil() as usize).max(1);
     let mut histogram = vec![0u32; num_bins];
 
     for item in &page_items {
         let w = effective_width(item);
+        if w > wide_threshold {
+            continue;
+        }
         let left = ((item.x - x_min) / BIN_WIDTH).floor() as usize;
         let right = (((item.x + w) - x_min) / BIN_WIDTH).ceil() as usize;
         let left = left.min(num_bins);
@@ -3034,6 +3042,111 @@ fn is_page_number(item: &TextItem) -> bool {
 }
 
 /// Group text items into lines, with multi-column support
+/// Detect newspaper-style columns: independent text flows that should be read
+/// sequentially (all of col1, then col2) rather than Y-interleaved.
+fn is_newspaper_layout(per_column_lines: &[Vec<TextLine>]) -> bool {
+    if per_column_lines.len() < 2 {
+        return false;
+    }
+
+    // Each column must independently have substantial content
+    let min_lines = per_column_lines.iter().map(|c| c.len()).min().unwrap_or(0);
+    if min_lines < 15 {
+        return false;
+    }
+
+    // Check Y-collision: count lines in the smallest column that have a
+    // Y-match in any other column. High collision with many lines = newspaper.
+    let y_tol = 3.0;
+    let (smallest_idx, _) = per_column_lines
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, c)| c.len())
+        .unwrap();
+
+    let smallest = &per_column_lines[smallest_idx];
+    let mut collisions = 0u32;
+    for line in smallest {
+        for (ci, col) in per_column_lines.iter().enumerate() {
+            if ci == smallest_idx {
+                continue;
+            }
+            if col.iter().any(|ol| (ol.y - line.y).abs() < y_tol) {
+                collisions += 1;
+                break;
+            }
+        }
+    }
+
+    let ratio = collisions as f32 / smallest.len() as f32;
+    ratio > 0.5
+}
+
+/// Split column lines into a core cluster and stragglers.
+/// The core is the largest group of consecutive lines separated by normal
+/// line spacing. Lines in other groups (header remnants, per-word items from
+/// full-width lines) are returned as stragglers.
+fn split_column_stragglers(lines: Vec<TextLine>) -> (Vec<TextLine>, Vec<TextLine>) {
+    if lines.len() < 3 {
+        return (lines, Vec::new());
+    }
+
+    // Lines are sorted Y descending (top-first). Compute gaps.
+    let mut gaps: Vec<f32> = Vec::new();
+    for i in 0..lines.len() - 1 {
+        gaps.push(lines[i].y - lines[i + 1].y);
+    }
+
+    // Median gap = typical line spacing
+    let mut sorted_gaps = gaps.clone();
+    sorted_gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_gap = sorted_gaps[sorted_gaps.len() / 2];
+
+    // A gap > 3× median (min 30pt) indicates a break between content clusters
+    let threshold = (median_gap * 3.0).max(30.0);
+
+    // Find all split points
+    let mut split_indices: Vec<usize> = Vec::new();
+    for (i, &gap) in gaps.iter().enumerate() {
+        if gap > threshold {
+            split_indices.push(i);
+        }
+    }
+
+    if split_indices.is_empty() {
+        return (lines, Vec::new());
+    }
+
+    // Build segments: (start_line_idx, end_line_idx_exclusive)
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for &si in &split_indices {
+        segments.push((start, si + 1));
+        start = si + 1;
+    }
+    segments.push((start, lines.len()));
+
+    // Find the largest segment (the core cluster)
+    let (core_seg, _) = segments
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (s, e))| e - s)
+        .unwrap();
+
+    let (cs, ce) = segments[core_seg];
+    let mut core = Vec::with_capacity(ce - cs);
+    let mut stragglers = Vec::new();
+    for (i, line) in lines.into_iter().enumerate() {
+        if i >= cs && i < ce {
+            core.push(line);
+        } else {
+            stragglers.push(line);
+        }
+    }
+
+    (core, stragglers)
+}
+
 pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
     if items.is_empty() {
         return Vec::new();
@@ -3103,45 +3216,104 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
             // Process spanning items as their own group
             let spanning_lines = group_single_column(spanning_items);
 
-            // Y-interleaved merge: combine all column lines and spanning lines,
-            // sort by Y position, and merge lines at the same Y from different
-            // columns into a single line. This correctly handles both tabular
-            // layouts (where rows span columns) and newspaper-style columns.
-            let mut all_page_lines: Vec<TextLine> = Vec::new();
-            all_page_lines.extend(spanning_lines);
-            for col_lines in per_column_lines {
-                all_page_lines.extend(col_lines);
-            }
+            if is_newspaper_layout(&per_column_lines) {
+                // Newspaper: columns are independent text flows.
+                // 1. Split each column into its densest cluster (core) and stragglers
+                // 2. Use core columns to determine the above/below threshold
+                // 3. Emit: above items → core columns sequentially → below items
+                let mut core_columns: Vec<Vec<TextLine>> = Vec::new();
+                let mut col_stragglers: Vec<Vec<TextLine>> = Vec::new();
+                for col in per_column_lines {
+                    let (core, stragglers) = split_column_stragglers(col);
+                    core_columns.push(core);
+                    col_stragglers.push(stragglers);
+                }
 
-            // Sort by Y descending (top-first), then by X for same-Y lines
-            all_page_lines.sort_by(|a, b| {
-                b.y.partial_cmp(&a.y)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(
-                        a.items
-                            .first()
-                            .map(|i| i.x)
-                            .unwrap_or(0.0)
-                            .partial_cmp(&b.items.first().map(|i| i.x).unwrap_or(0.0))
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-            });
+                // col_top = min of max Y across core columns
+                let col_top = core_columns
+                    .iter()
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.iter().map(|l| l.y).fold(f32::NEG_INFINITY, f32::max))
+                    .fold(f32::INFINITY, f32::min);
+                let margin = 5.0;
 
-            // Merge lines at the same Y (within tolerance) into single lines
-            let y_tol = 3.0;
-            let mut merged: Vec<TextLine> = Vec::new();
-            for line in all_page_lines {
-                if let Some(last) = merged.last_mut() {
-                    if last.page == line.page && (last.y - line.y).abs() < y_tol {
-                        last.items.extend(line.items);
-                        sort_line_items(&mut last.items);
-                        continue;
+                let mut above: Vec<TextLine> = Vec::new();
+                let mut below_spanning: Vec<TextLine> = Vec::new();
+
+                // Spanning items: above or below the column region
+                for line in spanning_lines {
+                    if line.y > col_top + margin {
+                        above.push(line);
+                    } else {
+                        below_spanning.push(line);
                     }
                 }
-                merged.push(line);
-            }
 
-            all_lines.extend(merged);
+                // Column stragglers above col_top go to "above";
+                // below col_top they stay with their column to avoid
+                // re-interleaving when sorted by Y.
+                let mut col_below: Vec<Vec<TextLine>> = vec![Vec::new(); core_columns.len()];
+                for (ci, stragglers) in col_stragglers.into_iter().enumerate() {
+                    for line in stragglers {
+                        if line.y > col_top + margin {
+                            above.push(line);
+                        } else {
+                            col_below[ci].push(line);
+                        }
+                    }
+                }
+
+                above.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+                below_spanning
+                    .sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+
+                all_lines.extend(above);
+                for col in core_columns {
+                    all_lines.extend(col);
+                }
+                for cb in col_below {
+                    all_lines.extend(cb);
+                }
+                all_lines.extend(below_spanning);
+            } else {
+                // Tabular: Y-interleaved merge — rows at the same Y from
+                // different columns form a single logical line.
+                let mut all_page_lines: Vec<TextLine> = Vec::new();
+                all_page_lines.extend(spanning_lines);
+                for col_lines in per_column_lines {
+                    all_page_lines.extend(col_lines);
+                }
+
+                // Sort by Y descending (top-first), then by X for same-Y lines
+                all_page_lines.sort_by(|a, b| {
+                    b.y.partial_cmp(&a.y)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(
+                            a.items
+                                .first()
+                                .map(|i| i.x)
+                                .unwrap_or(0.0)
+                                .partial_cmp(&b.items.first().map(|i| i.x).unwrap_or(0.0))
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
+                });
+
+                // Merge lines at the same Y (within tolerance) into single lines
+                let y_tol = 3.0;
+                let mut merged: Vec<TextLine> = Vec::new();
+                for line in all_page_lines {
+                    if let Some(last) = merged.last_mut() {
+                        if last.page == line.page && (last.y - line.y).abs() < y_tol {
+                            last.items.extend(line.items);
+                            sort_line_items(&mut last.items);
+                            continue;
+                        }
+                    }
+                    merged.push(line);
+                }
+
+                all_lines.extend(merged);
+            }
         }
     }
 
@@ -3760,5 +3932,67 @@ mod tests {
         assert!(is_cjk_char('\u{AC00}'));
         // Latin is not CJK
         assert!(!is_cjk_char('A'));
+    }
+
+    #[test]
+    fn test_newspaper_layout_detection() {
+        // Two dense columns (>15 lines each) with matching Y positions → newspaper
+        let make_line = |y: f32, x: f32, page: u32| TextLine {
+            y,
+            page,
+            items: vec![TextItem {
+                text: "text".into(),
+                x,
+                y,
+                width: 100.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            }],
+        };
+
+        let col1: Vec<TextLine> = (0..20)
+            .map(|i| make_line(700.0 - i as f32 * 14.0, 50.0, 1))
+            .collect();
+        let col2: Vec<TextLine> = (0..20)
+            .map(|i| make_line(700.0 - i as f32 * 14.0, 350.0, 1))
+            .collect();
+
+        assert!(is_newspaper_layout(&[col1, col2]));
+    }
+
+    #[test]
+    fn test_tabular_layout_detection() {
+        // Sparse columns (<15 lines) → tabular, not newspaper
+        let make_line = |y: f32, x: f32, page: u32| TextLine {
+            y,
+            page,
+            items: vec![TextItem {
+                text: "text".into(),
+                x,
+                y,
+                width: 100.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            }],
+        };
+
+        let col1: Vec<TextLine> = (0..5)
+            .map(|i| make_line(700.0 - i as f32 * 14.0, 50.0, 1))
+            .collect();
+        let col2: Vec<TextLine> = (0..5)
+            .map(|i| make_line(700.0 - i as f32 * 14.0, 350.0, 1))
+            .collect();
+
+        assert!(!is_newspaper_layout(&[col1, col2]));
     }
 }

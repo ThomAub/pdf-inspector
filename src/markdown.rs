@@ -623,9 +623,10 @@ fn to_markdown_from_lines_with_tables_and_images(
             }
         }
 
-        // Paragraph break (large Y gap relative to document's typical line spacing)
+        // Paragraph break: large forward Y gap (normal) or large backward jump
+        // (newspaper columns emitted sequentially on the same page).
         let y_gap = prev_y - line.y;
-        let is_para_break = y_gap > para_threshold;
+        let is_para_break = y_gap.abs() > para_threshold;
         if is_para_break && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
@@ -840,9 +841,10 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
 
-        // Paragraph break (large Y gap relative to document's typical line spacing)
+        // Paragraph break: large forward Y gap (normal) or large backward jump
+        // (newspaper columns emitted sequentially on the same page).
         let y_gap = prev_y - line.y;
-        let is_para_break = y_gap > para_threshold;
+        let is_para_break = y_gap.abs() > para_threshold;
         if is_para_break && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
