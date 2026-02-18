@@ -1,7 +1,8 @@
 //! Integration tests for pdf-to-markdown library
 
 use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
-use pdf_inspector::extractor::{group_into_lines, TextLine};
+use pdf_inspector::extractor::group_into_lines;
+use pdf_inspector::types::TextLine;
 use pdf_inspector::{
     detect_pdf_type, extract_text, extract_text_with_positions, to_markdown, MarkdownOptions,
     PdfError, PdfType, TextItem,
@@ -9,7 +10,7 @@ use pdf_inspector::{
 
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
-    use pdf_inspector::extractor::ItemType;
+    use pdf_inspector::types::ItemType;
     TextItem {
         text: text.to_string(),
         x,

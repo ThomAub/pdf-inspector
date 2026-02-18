@@ -8,8 +8,10 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 
 - **Smart classification** — Detect TextBased, Scanned, ImageBased, or Mixed PDFs in ~10-50ms by sampling content streams. Returns a confidence score (0.0-1.0) and per-page OCR routing.
 - **Text extraction** — Position-aware extraction with font info, X/Y coordinates, and automatic multi-column reading order.
-- **Markdown conversion** — Headings (H1-H4 via font size ratios), bullet/numbered/letter lists, code blocks (monospace font detection), tables, subscript/superscript, URL linking, and page breaks.
-- **CID font support** — Proper ToUnicode CMap decoding for Type0/Identity-H fonts, UTF-16BE, UTF-8, and Latin-1 encodings.
+- **Markdown conversion** — Headings (H1-H4 via font size ratios), bullet/numbered/letter lists, code blocks (monospace font detection), tables (rectangle-based and heuristic), bold/italic formatting, URL linking, and page breaks.
+- **Table detection** — Dual-mode: rectangle-based detection from PDF drawing ops, plus heuristic detection from text alignment. Handles financial tables, footnotes, and continuation tables across pages.
+- **CID font support** — ToUnicode CMap decoding for Type0/Identity-H fonts, UTF-16BE, UTF-8, and Latin-1 encodings.
+- **Multi-column layout** — Automatic detection of newspaper-style columns, sequential reading order, and RTL text support.
 - **Lightweight** — Pure Rust, no ML models, no external services. Single dependency on `lopdf` for PDF parsing.
 
 ## Quick start
@@ -107,6 +109,50 @@ cargo run --bin detect-pdf -- document.pdf
 cargo run --bin detect-pdf -- document.pdf --json
 ```
 
+## Architecture
+
+```
+PDF bytes
+  │
+  ├─► detector         → PdfType (TextBased / Scanned / ImageBased / Mixed)
+  │
+  └─► extractor
+        ├─ fonts        → font widths, encodings
+        ├─ content_stream → walk PDF operators → TextItems + PdfRects
+        ├─ xobjects     → Form XObject text, image placeholders
+        ├─ links        → hyperlinks, AcroForm fields
+        └─ layout       → column detection → line grouping → reading order
+              │
+              ├─► tables
+              │     ├─ detect_rects      → rectangle-based tables (union-find)
+              │     ├─ detect_heuristic  → alignment-based tables
+              │     ├─ grid              → column/row assignment → cells
+              │     └─ format            → cells → Markdown table
+              │
+              └─► markdown
+                    ├─ analysis     → font stats, heading tiers
+                    ├─ preprocess   → merge headings, drop caps
+                    ├─ convert      → line loop + table/image insertion
+                    ├─ classify     → captions, lists, code
+                    └─ postprocess  → cleanup → final Markdown
+```
+
+### Project structure
+
+```
+src/
+  lib.rs                — Public API, re-exports
+  types.rs              — Shared types: TextItem, TextLine, PdfRect, ItemType
+  text_utils.rs         — Character/text helpers (CJK, RTL, ligatures, bold/italic)
+  detector.rs           — Fast PDF type detection without full document load
+  glyph_names.rs        — Adobe Glyph List → Unicode mapping
+  tounicode.rs          — ToUnicode CMap parsing for CID-encoded text
+  extractor/            — Text extraction pipeline
+  tables/               — Table detection and formatting
+  markdown/             — Markdown conversion and structure detection
+  bin/                  — CLI tools and debug utilities
+```
+
 ## How classification works
 
 1. Parse the xref table and page tree (no full object load)
@@ -141,8 +187,9 @@ This detects 300+ page PDFs in milliseconds. The result includes `pages_needing_
 | `detect_pdf_type_mem_with_config(bytes, config)` | Classification from bytes with custom config |
 | `extract_text(path)` | Plain text extraction |
 | `extract_text_with_positions(path)` | Text with X/Y coordinates and font info |
-| `to_markdown(path, options)` | Convert directly to Markdown |
+| `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
+| `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
 
 ### Types
 
@@ -163,18 +210,31 @@ The converter handles:
 
 | Element | How it's detected |
 |---|---|
-| Headings (H1-H4) | Font size ratios relative to body text |
+| Headings (H1-H4) | Font size tiers relative to body text, with 0.5pt clustering |
+| Bold/italic | Font name patterns (Bold, Italic, Oblique) |
 | Bullet lists | `*`, `-`, `*`, `○`, `●`, `◦` prefixes |
 | Numbered lists | `1.`, `1)`, `(1)` patterns |
 | Letter lists | `a.`, `a)`, `(a)` patterns |
 | Code blocks | Monospace fonts (Courier, Consolas, Monaco, Menlo, Fira Code, JetBrains Mono) and keyword detection |
-| Tables | Position clustering for column/row boundaries |
-| Footnotes | Superscript numbers with corresponding text |
+| Tables | Rectangle-based detection from PDF drawing ops + heuristic detection from text alignment |
+| Financial tables | Token splitting for consolidated numeric values |
+| Captions | "Figure", "Table", "Source:" prefix detection |
 | Sub/superscript | Font size and Y-offset relative to baseline |
 | URLs | Converted to Markdown links |
 | Hyphenation | Rejoins words broken across lines |
 | Page numbers | Filtered from output |
 | Drop caps | Large initial letters merged with following text |
+| Dot leaders | TOC-style dots collapsed to " ... " |
+
+## Debug tools
+
+```bash
+cargo run --bin debug_spaces -- file.pdf     # Text items with x/y/width per page
+cargo run --bin dump_ops -- file.pdf         # Raw PDF content stream operators
+cargo run --bin debug_ygaps -- file.pdf      # Y-gap analysis between lines
+cargo run --bin debug_fonts -- file.pdf      # Font information
+cargo run --bin debug_order -- file.pdf      # Reading order visualization
+```
 
 ## Use case: smart PDF routing
 

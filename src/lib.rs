@@ -10,18 +10,19 @@ pub mod extractor;
 pub mod glyph_names;
 pub mod markdown;
 pub mod tables;
+pub mod text_utils;
 pub mod tounicode;
+pub mod types;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
-pub use extractor::{
-    extract_text, extract_text_with_positions, extract_text_with_positions_pages, PdfRect, TextItem,
-};
+pub use extractor::{extract_text, extract_text_with_positions, extract_text_with_positions_pages};
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
 };
+pub use types::{PdfRect, TextItem};
 
 use std::path::Path;
 
