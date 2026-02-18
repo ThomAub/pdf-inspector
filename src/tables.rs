@@ -26,11 +26,98 @@ pub struct Table {
     pub item_indices: Vec<usize>,
 }
 
+/// Disjoint-set (union-find) for clustering indices.
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        if self.parent[x] != x {
+            self.parent[x] = self.find(self.parent[x]);
+        }
+        self.parent[x]
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        if self.rank[ra] < self.rank[rb] {
+            self.parent[ra] = rb;
+        } else if self.rank[ra] > self.rank[rb] {
+            self.parent[rb] = ra;
+        } else {
+            self.parent[rb] = ra;
+            self.rank[ra] += 1;
+        }
+    }
+}
+
+/// Check if two rects overlap after expanding each by `tol` on all sides.
+fn rects_overlap(a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), tol: f32) -> bool {
+    // a and b are (x, y, w, h) where (x,y) is bottom-left corner
+    let (ax, ay, aw, ah) = *a;
+    let (bx, by, bw, bh) = *b;
+    // Expand each rect by tol
+    let a_left = ax - tol;
+    let a_right = ax + aw + tol;
+    let a_bottom = ay - tol;
+    let a_top = ay + ah + tol;
+    let b_left = bx - tol;
+    let b_right = bx + bw + tol;
+    let b_bottom = by - tol;
+    let b_top = by + bh + tol;
+    // AABB overlap: NOT (separated)
+    !(a_right < b_left || b_right < a_left || a_top < b_bottom || b_top < a_bottom)
+}
+
+/// Cluster rects by spatial overlap using union-find.
+/// Returns groups of rect indices; only groups with ≥ `min_size` rects are returned.
+fn cluster_rects(
+    rects: &[(f32, f32, f32, f32)],
+    tolerance: f32,
+    min_size: usize,
+) -> Vec<Vec<usize>> {
+    let n = rects.len();
+    let mut uf = UnionFind::new(n);
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if rects_overlap(&rects[i], &rects[j], tolerance) {
+                uf.union(i, j);
+            }
+        }
+    }
+
+    // Group indices by root
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..n {
+        groups.entry(uf.find(i)).or_default().push(i);
+    }
+
+    groups
+        .into_values()
+        .filter(|g| g.len() >= min_size)
+        .collect()
+}
+
 /// Detect tables from explicit rectangle (`re`) operators in the PDF.
 ///
 /// Many PDFs draw cell borders using `re` (rectangle) operators.  Table pages
 /// typically have 100-200+ rects while non-table pages have < 30.  This function
-/// identifies grids of cell-sized rectangles and assigns text items to cells.
+/// clusters spatially connected rectangles into groups, then identifies grids of
+/// cell-sized rectangles within each cluster and assigns text items to cells.
 pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32) -> Vec<Table> {
     // Filter rects on this page; normalize negative widths/heights; skip tiny rects.
     let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h) normalized
@@ -59,10 +146,34 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
         return vec![];
     }
 
+    // Cluster spatially connected rects into groups
+    let clusters = cluster_rects(&page_rects, 3.0, 6);
+
+    let mut tables = Vec::new();
+    for cluster_indices in &clusters {
+        let group_rects: Vec<(f32, f32, f32, f32)> =
+            cluster_indices.iter().map(|&i| page_rects[i]).collect();
+        if let Some(table) = detect_table_from_rect_group(items, &group_rects, page) {
+            tables.push(table);
+        }
+    }
+
+    tables
+}
+
+/// Detect a single table from a cluster of spatially connected rects.
+///
+/// Contains the grid-detection logic: snap edges, fill-ratio check,
+/// assign items to grid, content density validation.
+fn detect_table_from_rect_group(
+    items: &[TextItem],
+    group_rects: &[(f32, f32, f32, f32)],
+    page: u32,
+) -> Option<Table> {
     // Extract unique X and Y edges from all rects
     let mut x_edges: Vec<f32> = Vec::new();
     let mut y_edges: Vec<f32> = Vec::new();
-    for &(x, y, w, h) in &page_rects {
+    for &(x, y, w, h) in group_rects {
         x_edges.push(x);
         x_edges.push(x + w);
         y_edges.push(y);
@@ -74,7 +185,7 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
 
     if x_edges.len() < 3 || y_edges.len() < 4 {
         // Need at least 2 columns (3 edges) and 3 rows (4 edges)
-        return vec![];
+        return None;
     }
 
     // Sort column edges left-to-right, row edges top-to-bottom (highest Y first for PDF)
@@ -87,7 +198,13 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
     let num_rows = row_edges.len() - 1;
 
     if num_cols < 2 || num_rows < 2 {
-        return vec![];
+        return None;
+    }
+
+    // Reject grids that are too large — real tables rarely exceed 12 columns.
+    // Form-style PDFs with scattered field boxes produce huge sparse grids.
+    if num_cols > 12 {
+        return None;
     }
 
     // Verify that cell-sized rects actually fill the grid
@@ -100,7 +217,7 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
             let x_left = col_edges[col];
             let x_right = col_edges[col + 1];
             // Check if any rect approximately covers this cell
-            let cell_covered = page_rects.iter().any(|&(rx, ry, rw, rh)| {
+            let cell_covered = group_rects.iter().any(|&(rx, ry, rw, rh)| {
                 let tol = 3.0;
                 rx <= x_left + tol
                     && (rx + rw) >= x_right - tol
@@ -118,7 +235,7 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
 
     // Require at least 30% of cells to be backed by rects
     if fill_ratio < 0.3 {
-        return vec![];
+        return None;
     }
 
     // Build table: assign text items to cells
@@ -134,7 +251,7 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
 
     // Skip if no text was assigned
     if item_indices.is_empty() {
-        return vec![];
+        return None;
     }
 
     // Skip tables with only 1 row of content (header-only)
@@ -143,15 +260,37 @@ pub fn detect_tables_from_rects(items: &[TextItem], rects: &[PdfRect], page: u32
         .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
         .count();
     if non_empty_rows < 2 {
-        return vec![];
+        return None;
     }
 
-    vec![Table {
+    // Content density check: reject tables where most cells are empty.
+    // Real tables have content in most cells; form layouts produce sparse grids.
+    let non_empty_cells = cells
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    let content_ratio = non_empty_cells as f32 / total_cells;
+    if content_ratio < 0.25 {
+        return None;
+    }
+
+    // Reject tables with any completely empty column — indicates a bad grid.
+    for col in 0..num_cols {
+        let col_has_content = cells
+            .iter()
+            .any(|row| row.get(col).is_some_and(|c| !c.trim().is_empty()));
+        if !col_has_content {
+            return None;
+        }
+    }
+
+    Some(Table {
         columns,
         rows,
         cells,
         item_indices,
-    }]
+    })
 }
 
 /// Deduplicate nearby edge values within a tolerance, returning sorted unique edges.
