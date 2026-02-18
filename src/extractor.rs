@@ -31,6 +31,8 @@ struct FontWidthInfo {
     /// For Type1/TrueType: 0.001 (widths in 1000ths of em)
     /// For Type3: FontMatrix[0] (e.g., 0.00048828125 for 2048-unit grid)
     units_scale: f32,
+    /// Writing mode: 0 = horizontal (default), 1 = vertical
+    wmode: u8,
 }
 
 /// All font width info for a page, keyed by font resource name
@@ -193,6 +195,7 @@ fn parse_simple_font_widths(
         space_width,
         is_cid: false,
         units_scale,
+        wmode: 0,
     })
 }
 
@@ -240,12 +243,22 @@ fn parse_type0_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<F
             250
         });
 
+    let wmode = font_dict
+        .get(b"WMode")
+        .ok()
+        .and_then(|o| match o {
+            Object::Integer(n) => Some(*n as u8),
+            _ => None,
+        })
+        .unwrap_or(0);
+
     Some(FontWidthInfo {
         widths,
         default_width,
         space_width,
         is_cid: true,
         units_scale: 0.001, // CID fonts use standard 1000-unit system
+        wmode,
     })
 }
 
@@ -709,8 +722,13 @@ fn should_join_items(prev_item: &TextItem, curr_item: &TextItem) -> bool {
 
     // When we have accurate width from font metrics, use a tight threshold
     if prev_item.width > 0.0 {
-        let prev_end_x = prev_item.x + prev_item.width;
-        let gap = curr_item.x - prev_end_x;
+        let gap = if prev_item.x <= curr_item.x {
+            // LTR: prev is left of curr
+            curr_item.x - (prev_item.x + prev_item.width)
+        } else {
+            // RTL: prev is right of curr
+            prev_item.x - (curr_item.x + curr_item.width)
+        };
         let font_size = prev_item.font_size;
 
         // Never join across column-scale gaps
@@ -1669,9 +1687,14 @@ fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         }
     }
 
-    // Sort each group by X position
+    // Sort each group by X position (direction-aware)
     for (_, _, group) in &mut line_groups {
-        group.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        let rtl = is_rtl_text(group.iter().map(|i| &i.text));
+        if rtl {
+            group.sort_by(|a, b| b.x.partial_cmp(&a.x).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            group.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        }
     }
 
     // Sort groups by page then Y descending (top of page first)
@@ -2533,15 +2556,62 @@ fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32 {
 /// Check if a character is CJK (Chinese, Japanese, Korean).
 /// CJK languages don't use spaces between words, so word-boundary
 /// heuristics should not apply when CJK characters are involved.
-fn is_cjk_char(c: char) -> bool {
+pub(crate) fn is_cjk_char(c: char) -> bool {
     matches!(c,
-        '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
+        '\u{1100}'..='\u{11FF}'   // Hangul Jamo
+        | '\u{3000}'..='\u{303F}' // CJK Symbols and Punctuation
         | '\u{3040}'..='\u{309F}' // Hiragana
         | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{3130}'..='\u{318F}' // Hangul Compatibility Jamo
         | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
         | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
         | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
     )
+}
+
+pub(crate) fn is_rtl_char(c: char) -> bool {
+    matches!(c,
+        '\u{0590}'..='\u{05FF}'   // Hebrew
+        | '\u{0600}'..='\u{06FF}' // Arabic
+        | '\u{0700}'..='\u{074F}' // Syriac
+        | '\u{0750}'..='\u{077F}' // Arabic Supplement
+        | '\u{0780}'..='\u{07BF}' // Thaana
+        | '\u{07C0}'..='\u{07FF}' // NKo
+        | '\u{0800}'..='\u{083F}' // Samaritan
+        | '\u{0840}'..='\u{085F}' // Mandaic
+        | '\u{08A0}'..='\u{08FF}' // Arabic Extended-A
+        | '\u{FB1D}'..='\u{FB4F}' // Hebrew Presentation Forms
+        | '\u{FB50}'..='\u{FDFF}' // Arabic Presentation Forms-A
+        | '\u{FE70}'..='\u{FEFF}' // Arabic Presentation Forms-B
+    )
+}
+
+pub(crate) fn is_rtl_text<I, S>(texts: I) -> bool
+where
+    I: Iterator<Item = S>,
+    S: AsRef<str>,
+{
+    let (mut rtl, mut ltr) = (0u32, 0u32);
+    for t in texts {
+        for c in t.as_ref().chars() {
+            if is_rtl_char(c) {
+                rtl += 1;
+            } else if c.is_alphabetic() && !is_cjk_char(c) {
+                ltr += 1;
+            }
+        }
+    }
+    rtl > 0 && rtl > ltr
+}
+
+fn sort_line_items(items: &mut [TextItem]) {
+    let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+    if rtl {
+        items.sort_by(|a, b| b.x.partial_cmp(&a.x).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        items.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+    }
 }
 
 /// Detect if a font name indicates bold style
@@ -3064,9 +3134,7 @@ pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
                 if let Some(last) = merged.last_mut() {
                     if last.page == line.page && (last.y - line.y).abs() < y_tol {
                         last.items.extend(line.items);
-                        last.items.sort_by(|a, b| {
-                            a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        sort_line_items(&mut last.items);
                         continue;
                     }
                 }
@@ -3192,10 +3260,9 @@ fn group_single_column(items: Vec<TextItem>) -> Vec<TextLine> {
         }
     }
 
-    // Sort items within each line by X position (left to right)
+    // Sort items within each line by X position (direction-aware)
     for line in &mut lines {
-        line.items
-            .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        sort_line_items(&mut line.items);
     }
 
     lines
@@ -3587,5 +3654,111 @@ mod tests {
             "Full-width text should not be split into columns, got {:?}",
             cols
         );
+    }
+
+    #[test]
+    fn test_is_rtl_char() {
+        // Hebrew alef
+        assert!(is_rtl_char('\u{05D0}'));
+        // Arabic alif
+        assert!(is_rtl_char('\u{0627}'));
+        // Latin 'A' is not RTL
+        assert!(!is_rtl_char('A'));
+        // CJK is not RTL
+        assert!(!is_rtl_char('\u{4E00}'));
+    }
+
+    #[test]
+    fn test_is_rtl_text() {
+        // Majority Hebrew with digits → RTL
+        assert!(is_rtl_text(["\u{05E9}\u{05DC}\u{05D5}\u{05DD} 123"].iter()));
+        // Majority Latin → not RTL
+        assert!(!is_rtl_text(["Hello world"].iter()));
+        // Empty → not RTL
+        assert!(!is_rtl_text(std::iter::empty::<&str>()));
+    }
+
+    #[test]
+    fn test_rtl_line_sorting() {
+        let mut items = vec![
+            TextItem {
+                text: "\u{05D0}".into(), // alef at x=100
+                x: 100.0,
+                y: 700.0,
+                width: 10.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "\u{05D1}".into(), // bet at x=200 (rightmost)
+                x: 200.0,
+                y: 700.0,
+                width: 10.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+        ];
+        sort_line_items(&mut items);
+        // RTL: rightmost (higher X) comes first
+        assert_eq!(items[0].x, 200.0);
+        assert_eq!(items[1].x, 100.0);
+    }
+
+    #[test]
+    fn test_ltr_unaffected() {
+        let mut items = vec![
+            TextItem {
+                text: "Hello".into(),
+                x: 100.0,
+                y: 700.0,
+                width: 50.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+            TextItem {
+                text: "World".into(),
+                x: 200.0,
+                y: 700.0,
+                width: 50.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            },
+        ];
+        sort_line_items(&mut items);
+        // LTR: leftmost comes first
+        assert_eq!(items[0].x, 100.0);
+        assert_eq!(items[1].x, 200.0);
+    }
+
+    #[test]
+    fn test_hangul_is_cjk() {
+        // Hangul Jamo
+        assert!(is_cjk_char('\u{1100}'));
+        // Hangul Compatibility Jamo
+        assert!(is_cjk_char('\u{3131}'));
+        // Hangul Syllable '가'
+        assert!(is_cjk_char('\u{AC00}'));
+        // Latin is not CJK
+        assert!(!is_cjk_char('A'));
     }
 }

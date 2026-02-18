@@ -2,7 +2,7 @@
 //!
 //! Detects tabular data in PDF text items and converts to markdown tables.
 
-use crate::extractor::{PdfRect, TextItem};
+use crate::extractor::{is_rtl_text, PdfRect, TextItem};
 
 /// Detection mode controls thresholds for table validation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -968,8 +968,15 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(columns.len());
         for col_items in row_items.iter_mut() {
-            // Sort by X position
-            col_items.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            // Sort by X position (direction-aware)
+            let rtl = is_rtl_text(col_items.iter().map(|i| &i.text));
+            if rtl {
+                col_items
+                    .sort_by(|a, b| b.x.partial_cmp(&a.x).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                col_items
+                    .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            }
 
             // Join items with subscript-aware spacing
             let text = join_cell_items(col_items);
