@@ -823,6 +823,39 @@ mod tests {
     }
 
     #[test]
+    fn test_newspaper_layout_misaligned_baselines() {
+        // Two dense balanced columns with non-aligned Y positions (e.g. government gazettes
+        // where columns are independently typeset) → should still be newspaper
+        let make_line = |y: f32, x: f32, page: u32| TextLine {
+            y,
+            page,
+            items: vec![TextItem {
+                text: "text".into(),
+                x,
+                y,
+                width: 100.0,
+                height: 12.0,
+                font: "F1".into(),
+                font_size: 12.0,
+                page,
+                is_bold: false,
+                is_italic: false,
+                item_type: ItemType::Text,
+            }],
+        };
+
+        // Col1 starts at Y=700, col2 starts at Y=685 (15pt offset — no Y-collision)
+        let col1: Vec<TextLine> = (0..20)
+            .map(|i| make_line(700.0 - i as f32 * 14.0, 50.0, 1))
+            .collect();
+        let col2: Vec<TextLine> = (0..20)
+            .map(|i| make_line(685.0 - i as f32 * 14.0, 350.0, 1))
+            .collect();
+
+        assert!(is_newspaper_layout(&[col1, col2]));
+    }
+
+    #[test]
     fn test_tabular_layout_detection() {
         // Sparse columns (<15 lines) → tabular, not newspaper
         let make_line = |y: f32, x: f32, page: u32| TextLine {

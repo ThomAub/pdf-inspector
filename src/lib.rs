@@ -10,6 +10,7 @@ pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
 pub mod markdown;
+pub mod process_mode;
 pub mod tables;
 pub mod text_utils;
 pub mod tounicode;
@@ -23,6 +24,7 @@ pub use extractor::{extract_text, extract_text_with_positions, extract_text_with
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects, MarkdownOptions,
 };
+pub use process_mode::ProcessMode;
 pub use types::{LayoutComplexity, PdfRect, TextItem};
 
 use std::path::Path;
@@ -166,17 +168,41 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
     let title = detection.title;
     let confidence = detection.confidence;
 
+    // DetectOnly: return immediately after detection
+    if markdown_options.process_mode == ProcessMode::DetectOnly {
+        return Ok(PdfProcessResult {
+            pdf_type,
+            text: None,
+            markdown: None,
+            page_count,
+            processing_time_ms: start.elapsed().as_millis() as u64,
+            pages_needing_ocr,
+            title,
+            confidence,
+            layout: LayoutComplexity::default(),
+        });
+    }
+
     let result = match pdf_type {
         PdfType::TextBased => {
             let (items, rects) =
                 extractor::extract_text_with_positions_and_rects(&path, page_filter)?;
             let layout = compute_layout_complexity(&items, &rects);
-            let markdown = to_markdown_from_items_with_rects(items, markdown_options, &rects);
+
+            let markdown = if markdown_options.process_mode == ProcessMode::Analyze {
+                None
+            } else {
+                Some(to_markdown_from_items_with_rects(
+                    items,
+                    markdown_options,
+                    &rects,
+                ))
+            };
 
             PdfProcessResult {
                 pdf_type,
                 text: None,
-                markdown: Some(markdown),
+                markdown,
                 page_count,
                 processing_time_ms: start.elapsed().as_millis() as u64,
                 pages_needing_ocr,
@@ -202,9 +228,16 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
             let (markdown, layout) = match extracted {
                 Some((items, rects)) => {
                     let layout = compute_layout_complexity(&items, &rects);
-                    let md =
-                        to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects);
-                    (Some(md), layout)
+                    let md = if markdown_options.process_mode == ProcessMode::Analyze {
+                        None
+                    } else {
+                        Some(to_markdown_from_items_with_rects(
+                            items,
+                            markdown_options.clone(),
+                            &rects,
+                        ))
+                    };
+                    (md, layout)
                 }
                 None => (None, LayoutComplexity::default()),
             };
@@ -228,80 +261,11 @@ pub fn process_pdf_with_config_pages<P: AsRef<Path>>(
 
 /// Process PDF from memory buffer
 pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
-    let start = std::time::Instant::now();
-
-    validate_pdf_bytes(buffer)?;
-
-    // Step 1: Smart detection (fast, no full load)
-    let detection = detector::detect_pdf_type_mem(buffer)?;
-    let page_count = detection.page_count;
-    let pdf_type = detection.pdf_type;
-    let pages_needing_ocr = detection.pages_needing_ocr;
-    let title = detection.title;
-    let confidence = detection.confidence;
-
-    let result = match pdf_type {
-        PdfType::TextBased => {
-            // Step 2: Full extraction with position-aware reading order
-            let (items, rects) =
-                extractor::extract_text_with_positions_mem_and_rects(buffer, None)?;
-            let layout = compute_layout_complexity(&items, &rects);
-            let markdown =
-                to_markdown_from_items_with_rects(items, MarkdownOptions::default(), &rects);
-
-            PdfProcessResult {
-                pdf_type,
-                text: None,
-                markdown: Some(markdown),
-                page_count,
-                processing_time_ms: start.elapsed().as_millis() as u64,
-                pages_needing_ocr,
-                title,
-                confidence,
-                layout,
-            }
-        }
-        PdfType::Scanned | PdfType::ImageBased => PdfProcessResult {
-            pdf_type,
-            text: None,
-            markdown: None,
-            page_count,
-            processing_time_ms: start.elapsed().as_millis() as u64,
-            pages_needing_ocr,
-            title,
-            confidence,
-            layout: LayoutComplexity::default(),
-        },
-        PdfType::Mixed => {
-            let extracted = extractor::extract_text_with_positions_mem_and_rects(buffer, None).ok();
-            let (markdown, layout) = match extracted {
-                Some((items, rects)) => {
-                    let layout = compute_layout_complexity(&items, &rects);
-                    let md = to_markdown_from_items_with_rects(
-                        items,
-                        MarkdownOptions::default(),
-                        &rects,
-                    );
-                    (Some(md), layout)
-                }
-                None => (None, LayoutComplexity::default()),
-            };
-
-            PdfProcessResult {
-                pdf_type,
-                text: None,
-                markdown,
-                page_count,
-                processing_time_ms: start.elapsed().as_millis() as u64,
-                pages_needing_ocr,
-                title,
-                confidence,
-                layout,
-            }
-        }
-    };
-
-    Ok(result)
+    process_pdf_mem_with_config(
+        buffer,
+        DetectionConfig::default(),
+        MarkdownOptions::default(),
+    )
 }
 
 /// Process PDF from memory buffer with custom detection and markdown configuration
@@ -321,17 +285,41 @@ pub fn process_pdf_mem_with_config(
     let title = detection.title;
     let confidence = detection.confidence;
 
+    // DetectOnly: return immediately after detection
+    if markdown_options.process_mode == ProcessMode::DetectOnly {
+        return Ok(PdfProcessResult {
+            pdf_type,
+            text: None,
+            markdown: None,
+            page_count,
+            processing_time_ms: start.elapsed().as_millis() as u64,
+            pages_needing_ocr,
+            title,
+            confidence,
+            layout: LayoutComplexity::default(),
+        });
+    }
+
     let result = match pdf_type {
         PdfType::TextBased => {
             let (items, rects) =
                 extractor::extract_text_with_positions_mem_and_rects(buffer, None)?;
             let layout = compute_layout_complexity(&items, &rects);
-            let markdown = to_markdown_from_items_with_rects(items, markdown_options, &rects);
+
+            let markdown = if markdown_options.process_mode == ProcessMode::Analyze {
+                None
+            } else {
+                Some(to_markdown_from_items_with_rects(
+                    items,
+                    markdown_options,
+                    &rects,
+                ))
+            };
 
             PdfProcessResult {
                 pdf_type,
                 text: None,
-                markdown: Some(markdown),
+                markdown,
                 page_count,
                 processing_time_ms: start.elapsed().as_millis() as u64,
                 pages_needing_ocr,
@@ -356,9 +344,16 @@ pub fn process_pdf_mem_with_config(
             let (markdown, layout) = match extracted {
                 Some((items, rects)) => {
                     let layout = compute_layout_complexity(&items, &rects);
-                    let md =
-                        to_markdown_from_items_with_rects(items, markdown_options.clone(), &rects);
-                    (Some(md), layout)
+                    let md = if markdown_options.process_mode == ProcessMode::Analyze {
+                        None
+                    } else {
+                        Some(to_markdown_from_items_with_rects(
+                            items,
+                            markdown_options.clone(),
+                            &rects,
+                        ))
+                    };
+                    (md, layout)
                 }
                 None => (None, LayoutComplexity::default()),
             };

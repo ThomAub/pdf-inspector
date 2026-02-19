@@ -17,6 +17,7 @@ pub use convert::to_markdown_from_lines;
 use std::collections::{HashMap, HashSet};
 
 use crate::extractor::group_into_lines;
+use crate::process_mode::ProcessMode;
 use crate::types::TextItem;
 
 use analysis::calculate_font_stats_from_items;
@@ -50,6 +51,8 @@ pub struct MarkdownOptions {
     pub include_links: bool,
     /// Insert page break markers (<!-- Page N -->) between pages
     pub include_page_numbers: bool,
+    /// Controls how far the processing pipeline runs.
+    pub process_mode: ProcessMode,
 }
 
 impl Default for MarkdownOptions {
@@ -67,6 +70,7 @@ impl Default for MarkdownOptions {
             include_images: true,
             include_links: true,
             include_page_numbers: false,
+            process_mode: ProcessMode::default(),
         }
     }
 }

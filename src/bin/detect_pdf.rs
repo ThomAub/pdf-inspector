@@ -1,6 +1,9 @@
 //! CLI tool for detecting PDF type (text-based vs scanned)
 
-use pdf_inspector::{detect_pdf_type, PdfType};
+use pdf_inspector::{
+    detect_pdf_type, process_pdf_with_config_pages, DetectionConfig, MarkdownOptions, PdfType,
+    ProcessMode,
+};
 use std::env;
 use std::process;
 use std::time::Instant;
@@ -12,14 +15,123 @@ fn main() {
     if args.len() < 2 {
         eprintln!("Usage: {} <pdf_file>", args[0]);
         eprintln!("       {} <pdf_file> --json", args[0]);
+        eprintln!("       {} <pdf_file> --analyze", args[0]);
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --json       Output result as JSON");
+        eprintln!("  --analyze    Also run layout analysis (tables, columns)");
         process::exit(1);
     }
 
     let pdf_path = &args[1];
-    let json_output = args.get(2).map(|a| a == "--json").unwrap_or(false);
+    let json_output = args.iter().any(|a| a == "--json");
+    let analyze = args.iter().any(|a| a == "--analyze");
 
     let start = Instant::now();
 
+    if analyze {
+        run_analyze(pdf_path, json_output, start);
+    } else {
+        run_detect_only(pdf_path, json_output, start);
+    }
+}
+
+fn pdf_type_str(pdf_type: &PdfType) -> &'static str {
+    match pdf_type {
+        PdfType::TextBased => "text_based",
+        PdfType::Scanned => "scanned",
+        PdfType::ImageBased => "image_based",
+        PdfType::Mixed => "mixed",
+    }
+}
+
+fn run_analyze(pdf_path: &str, json_output: bool, start: Instant) {
+    let md_options = MarkdownOptions {
+        process_mode: ProcessMode::Analyze,
+        ..Default::default()
+    };
+
+    match process_pdf_with_config_pages(pdf_path, DetectionConfig::default(), md_options, None) {
+        Ok(result) => {
+            let elapsed = start.elapsed();
+
+            if json_output {
+                let ocr_pages: Vec<String> = result
+                    .pages_needing_ocr
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
+                let table_pages: Vec<String> = result
+                    .layout
+                    .pages_with_tables
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
+                let col_pages: Vec<String> = result
+                    .layout
+                    .pages_with_columns
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
+                println!(
+                    r#"{{"pdf_type":"{}","page_count":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}],"detection_time_ms":{}}}"#,
+                    pdf_type_str(&result.pdf_type),
+                    result.page_count,
+                    ocr_pages.join(","),
+                    result.layout.is_complex,
+                    table_pages.join(","),
+                    col_pages.join(","),
+                    elapsed.as_millis()
+                );
+            } else {
+                println!("PDF Type Detection + Layout Analysis");
+                println!("=====================================");
+                println!("File: {}", pdf_path);
+                println!();
+                println!(
+                    "Type: {}",
+                    match result.pdf_type {
+                        PdfType::TextBased => "TEXT-BASED (extractable text)",
+                        PdfType::Scanned => "SCANNED (OCR needed)",
+                        PdfType::ImageBased => "IMAGE-BASED (mostly images, OCR may help)",
+                        PdfType::Mixed => "MIXED (some text, some images)",
+                    }
+                );
+                println!("Page count: {}", result.page_count);
+                if !result.pages_needing_ocr.is_empty() {
+                    println!("Pages needing OCR: {:?}", result.pages_needing_ocr);
+                }
+                println!();
+                if result.layout.is_complex {
+                    println!("Layout: COMPLEX");
+                    if !result.layout.pages_with_tables.is_empty() {
+                        println!("  Pages with tables: {:?}", result.layout.pages_with_tables);
+                    }
+                    if !result.layout.pages_with_columns.is_empty() {
+                        println!(
+                            "  Pages with columns: {:?}",
+                            result.layout.pages_with_columns
+                        );
+                    }
+                } else {
+                    println!("Layout: simple");
+                }
+                println!();
+                println!("Detection time: {}ms", elapsed.as_millis());
+            }
+        }
+        Err(e) => {
+            if json_output {
+                println!(r#"{{"error":"{}"}}"#, e);
+            } else {
+                eprintln!("Error: {}", e);
+            }
+            process::exit(1);
+        }
+    }
+}
+
+fn run_detect_only(pdf_path: &str, json_output: bool, start: Instant) {
     match detect_pdf_type(pdf_path) {
         Ok(result) => {
             let elapsed = start.elapsed();
@@ -32,12 +144,7 @@ fn main() {
                     .collect();
                 println!(
                     r#"{{"pdf_type":"{}","page_count":{},"pages_sampled":{},"pages_with_text":{},"confidence":{:.2},"title":{},"ocr_recommended":{},"pages_needing_ocr":[{}],"detection_time_ms":{}}}"#,
-                    match result.pdf_type {
-                        PdfType::TextBased => "text_based",
-                        PdfType::Scanned => "scanned",
-                        PdfType::ImageBased => "image_based",
-                        PdfType::Mixed => "mixed",
-                    },
+                    pdf_type_str(&result.pdf_type),
                     result.page_count,
                     result.pages_sampled,
                     result.pages_with_text,

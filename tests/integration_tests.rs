@@ -267,6 +267,7 @@ fn test_markdown_options_custom() {
         include_images: false,
         include_links: false,
         include_page_numbers: false,
+        ..Default::default()
     };
     assert!(!opts.detect_headers);
     assert!(opts.detect_lists);

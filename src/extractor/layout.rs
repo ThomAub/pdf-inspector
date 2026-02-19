@@ -260,9 +260,17 @@ pub(crate) fn is_newspaper_layout(per_column_lines: &[Vec<TextLine>]) -> bool {
         return false;
     }
 
-    // Check Y-collision: count lines in the smallest column that have a
-    // Y-match in any other column. High collision with many lines = newspaper.
-    let y_tol = 3.0;
+    // Dense balanced columns (similar line counts) are newspaper regardless of Y-alignment.
+    // By this point table items are already removed, so two dense balanced columns
+    // of remaining text are independent prose flows.
+    let max_lines = per_column_lines.iter().map(|c| c.len()).max().unwrap_or(0);
+    let balance_ratio = min_lines as f32 / max_lines as f32;
+    if balance_ratio > 0.7 {
+        return true;
+    }
+
+    // For unbalanced columns, fall back to Y-collision check
+    let y_tol = 5.0; // was 3.0 — handles government gazette typesetting variance
     let (smallest_idx, _) = per_column_lines
         .iter()
         .enumerate()

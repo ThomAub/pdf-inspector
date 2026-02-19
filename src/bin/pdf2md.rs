@@ -2,6 +2,7 @@
 
 use pdf_inspector::{
     process_pdf_with_config_pages, DetectionConfig, LayoutComplexity, MarkdownOptions, PdfType,
+    ProcessMode,
 };
 use std::collections::HashSet;
 use std::env;
@@ -75,6 +76,8 @@ fn main() {
         eprintln!("  --raw               Output only markdown (no headers)");
         eprintln!("  --pages             Insert page break markers (<!-- Page N -->)");
         eprintln!("  --select-pages N    Only process specified pages (e.g. 1,3,5-10)");
+        eprintln!("  --detect-only       Only detect PDF type (no extraction)");
+        eprintln!("  --analyze           Detect + extract + layout analysis (no markdown)");
         process::exit(1);
     }
 
@@ -82,6 +85,8 @@ fn main() {
     let json_output = args.iter().any(|a| a == "--json");
     let raw_output = args.iter().any(|a| a == "--raw");
     let page_numbers = args.iter().any(|a| a == "--pages");
+    let detect_only = args.iter().any(|a| a == "--detect-only");
+    let analyze = args.iter().any(|a| a == "--analyze");
 
     // Parse --select-pages value
     let page_filter = args
@@ -107,8 +112,17 @@ fn main() {
         .filter(|a| !a.starts_with("--"))
         .map(|s| s.as_str());
 
+    let process_mode = if detect_only {
+        ProcessMode::DetectOnly
+    } else if analyze {
+        ProcessMode::Analyze
+    } else {
+        ProcessMode::Full
+    };
+
     let md_options = MarkdownOptions {
         include_page_numbers: page_numbers,
+        process_mode,
         ..Default::default()
     };
 
@@ -119,7 +133,55 @@ fn main() {
         page_filter.as_ref(),
     ) {
         Ok(result) => {
-            if json_output {
+            if detect_only || analyze {
+                // Non-full modes: output detection/analysis info
+                let pdf_type_str = match result.pdf_type {
+                    PdfType::TextBased => "text_based",
+                    PdfType::Scanned => "scanned",
+                    PdfType::ImageBased => "image_based",
+                    PdfType::Mixed => "mixed",
+                };
+
+                if json_output {
+                    let ocr_pages: Vec<String> = result
+                        .pages_needing_ocr
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect();
+                    let table_pages: Vec<String> = result
+                        .layout
+                        .pages_with_tables
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect();
+                    let col_pages: Vec<String> = result
+                        .layout
+                        .pages_with_columns
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect();
+                    println!(
+                        r#"{{"pdf_type":"{}","page_count":{},"processing_time_ms":{},"pages_needing_ocr":[{}],"is_complex":{},"pages_with_tables":[{}],"pages_with_columns":[{}]}}"#,
+                        pdf_type_str,
+                        result.page_count,
+                        result.processing_time_ms,
+                        ocr_pages.join(","),
+                        result.layout.is_complex,
+                        table_pages.join(","),
+                        col_pages.join(","),
+                    );
+                } else {
+                    eprintln!("Type: {}", pdf_type_str);
+                    eprintln!("Pages: {}", result.page_count);
+                    eprintln!("Processing time: {}ms", result.processing_time_ms);
+                    if !result.pages_needing_ocr.is_empty() {
+                        eprintln!("Pages needing OCR: {:?}", result.pages_needing_ocr);
+                    }
+                    if analyze {
+                        print_layout_info(&result.layout);
+                    }
+                }
+            } else if json_output {
                 let md_escaped = result
                     .markdown
                     .as_ref()
