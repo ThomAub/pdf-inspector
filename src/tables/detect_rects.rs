@@ -88,10 +88,13 @@ pub(crate) fn cluster_rects(
         groups.entry(uf.find(i)).or_default().push(i);
     }
 
-    groups
-        .into_values()
-        .filter(|g| g.len() >= min_size)
-        .collect()
+    // Sort by root index for deterministic output order
+    let mut result: Vec<(usize, Vec<usize>)> = groups
+        .into_iter()
+        .filter(|(_, g)| g.len() >= min_size)
+        .collect();
+    result.sort_by_key(|(root, _)| *root);
+    result.into_iter().map(|(_, g)| g).collect()
 }
 
 /// Detect tables from explicit rectangle (`re`) operators in the PDF.

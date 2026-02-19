@@ -21,9 +21,12 @@ pub(crate) fn calculate_font_stats_from_items(items: &[TextItem]) -> FontStats {
         }
     }
 
+    // Break ties by preferring the smaller font size for deterministic output
     let most_common_size = size_counts
         .iter()
-        .max_by_key(|(_, count)| *count)
+        .max_by(|(size_a, count_a), (size_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| size_b.cmp(size_a))
+        })
         .map(|(size, _)| *size as f32 / 10.0)
         .unwrap_or(12.0);
 
@@ -45,9 +48,12 @@ pub(crate) fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
         }
     }
 
+    // Break ties by preferring the smaller font size for deterministic output
     let most_common_size = size_counts
         .iter()
-        .max_by_key(|(_, count)| *count)
+        .max_by(|(size_a, count_a), (size_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| size_b.cmp(size_a))
+        })
         .map(|(size, _)| *size as f32 / 10.0)
         .unwrap_or(12.0);
 

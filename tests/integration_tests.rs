@@ -840,6 +840,87 @@ fn test_not_a_pdf_extract_text_mem() {
 }
 
 // ============================================================================
+// Snapshot Regression Tests (PDF fixtures)
+// ============================================================================
+
+/// Process a PDF fixture and compare output against the golden snapshot.
+///
+/// This catches regressions where code changes silently alter extraction
+/// or markdown output. If a change is intentional, update the snapshot:
+///   cargo run --release --bin pdf2md -- tests/fixtures/<name>.pdf > tests/snapshots/<name>.md
+fn assert_snapshot(fixture: &str) {
+    let fixture_path = format!("tests/fixtures/{}.pdf", fixture);
+    let snapshot_path = format!("tests/snapshots/{}.md", fixture);
+
+    let result = pdf_inspector::process_pdf(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to process {}: {}", fixture_path, e));
+    let actual = result.markdown.unwrap_or_default();
+    let actual = actual.trim_end();
+
+    let expected = std::fs::read_to_string(&snapshot_path)
+        .unwrap_or_else(|e| panic!("Failed to read snapshot {}: {}", snapshot_path, e));
+    let expected = expected.trim_end();
+
+    if actual != expected {
+        // Show a helpful diff summary
+        let actual_lines: Vec<&str> = actual.lines().collect();
+        let expected_lines: Vec<&str> = expected.lines().collect();
+
+        let mut diffs = Vec::new();
+        let max_lines = actual_lines.len().max(expected_lines.len());
+        for i in 0..max_lines {
+            let a = actual_lines.get(i).unwrap_or(&"<missing>");
+            let e = expected_lines.get(i).unwrap_or(&"<missing>");
+            if a != e {
+                diffs.push(format!(
+                    "  line {}: expected {:?}, got {:?}",
+                    i + 1,
+                    &e[..e.len().min(80)],
+                    &a[..a.len().min(80)]
+                ));
+                if diffs.len() >= 5 {
+                    diffs.push("  ... (more diffs truncated)".to_string());
+                    break;
+                }
+            }
+        }
+
+        panic!(
+            "Snapshot mismatch for {}:\n{}\n\nTo update: cargo run --release --bin pdf2md -- {} > {}",
+            fixture,
+            diffs.join("\n"),
+            fixture_path,
+            snapshot_path,
+        );
+    }
+}
+
+#[test]
+fn test_snapshot_nexo_price_en() {
+    assert_snapshot("nexo-price-en");
+}
+
+#[test]
+fn test_snapshot_thermo_freon12() {
+    assert_snapshot("thermo-freon12");
+}
+
+#[test]
+fn test_snapshot_td9264() {
+    assert_snapshot("td9264");
+}
+
+#[test]
+fn test_snapshot_p1244() {
+    assert_snapshot("p1244-1996");
+}
+
+#[test]
+fn test_snapshot_real_estate_pricing() {
+    assert_snapshot("real-estate-pricing");
+}
+
+// ============================================================================
 // Pages Needing OCR Tests
 // ============================================================================
 

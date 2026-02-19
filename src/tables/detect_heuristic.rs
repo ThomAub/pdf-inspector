@@ -654,9 +654,12 @@ fn has_consistent_columns(cells: &[Vec<String>]) -> bool {
         *count_freq.entry(count).or_insert(0) += 1;
     }
 
+    // Break ties by preferring higher column count for deterministic output
     let most_common_count = count_freq
         .iter()
-        .max_by_key(|(_, freq)| *freq)
+        .max_by(|(count_a, freq_a), (count_b, freq_b)| {
+            freq_a.cmp(freq_b).then_with(|| count_a.cmp(count_b))
+        })
         .map(|(count, _)| *count)
         .unwrap_or(0);
 
