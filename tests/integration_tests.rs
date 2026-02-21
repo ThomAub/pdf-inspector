@@ -57,7 +57,7 @@ fn make_text_item_with_font(
 #[test]
 fn test_detection_config_default() {
     let config = DetectionConfig::default();
-    assert!(matches!(config.strategy, ScanStrategy::EarlyExit));
+    assert!(matches!(config.strategy, ScanStrategy::Sample(8)));
     assert_eq!(config.min_text_ops_per_page, 3);
     assert!((config.text_page_ratio_threshold - 0.6).abs() < 0.001);
 }

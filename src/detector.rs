@@ -6,7 +6,7 @@
 
 use crate::PdfError;
 use lopdf::{Document, Object, ObjectId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// PDF type classification
@@ -76,7 +76,9 @@ pub struct DetectionConfig {
 impl Default for DetectionConfig {
     fn default() -> Self {
         Self {
-            strategy: ScanStrategy::EarlyExit,
+            // EarlyExit is too aggressive for PDFs with an image-only cover
+            // followed by text-heavy pages (e.g., annual reports).
+            strategy: ScanStrategy::Sample(8),
             min_text_ops_per_page: 3,
             text_page_ratio_threshold: 0.6,
         }
@@ -348,6 +350,23 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         }
     }
 
+    // Scan XObject Form contents for text operators
+    if let Ok((resource_dict, resource_ids)) = doc.get_page_resources(page_id) {
+        let mut visited = HashSet::new();
+        if let Some(resources) = resource_dict {
+            let (ops, imgs) = scan_xobjects_in_resources(doc, resources, &mut visited);
+            text_ops += ops;
+            has_images = has_images || imgs;
+        }
+        for resource_id in resource_ids {
+            if let Ok(resources) = doc.get_dictionary(resource_id) {
+                let (ops, imgs) = scan_xobjects_in_resources(doc, resources, &mut visited);
+                text_ops += ops;
+                has_images = has_images || imgs;
+            }
+        }
+    }
+
     // Check for XObject images and calculate coverage
     let (found_images, total_image_area, has_template_image) = analyze_page_images(doc, page_id);
 
@@ -361,6 +380,66 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_template_image,
         total_image_area,
     }
+}
+
+fn scan_xobjects_in_resources(
+    doc: &Document,
+    resources: &lopdf::Dictionary,
+    visited: &mut HashSet<ObjectId>,
+) -> (u32, bool) {
+    let mut text_ops = 0u32;
+    let mut has_images = false;
+
+    let xobjects = match resources.get(b"XObject").ok() {
+        Some(Object::Dictionary(d)) => Some(d.clone()),
+        Some(Object::Reference(r)) => doc.get_dictionary(*r).ok().cloned(),
+        _ => None,
+    };
+
+    if let Some(xobj_dict) = xobjects {
+        for (_, obj) in xobj_dict.iter() {
+            let Some(obj_id) = obj.as_reference().ok() else {
+                continue;
+            };
+            if !visited.insert(obj_id) {
+                continue;
+            }
+            let Ok(Object::Stream(stream)) = doc.get_object(obj_id) else {
+                continue;
+            };
+            let subtype = stream
+                .dict
+                .get(b"Subtype")
+                .ok()
+                .and_then(|o| o.as_name().ok());
+            match subtype {
+                Some(b"Form") => {
+                    let content = stream
+                        .decompressed_content()
+                        .unwrap_or_else(|_| stream.content.clone());
+                    let (ops, imgs) = scan_content_for_text_operators(&content);
+                    text_ops += ops;
+                    has_images = has_images || imgs;
+                    if let Some(res) = stream
+                        .dict
+                        .get(b"Resources")
+                        .ok()
+                        .and_then(|o| o.as_dict().ok())
+                    {
+                        let (ops2, imgs2) = scan_xobjects_in_resources(doc, res, visited);
+                        text_ops += ops2;
+                        has_images = has_images || imgs2;
+                    }
+                }
+                Some(b"Image") => {
+                    has_images = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (text_ops, has_images)
 }
 
 /// Fast scan of content stream bytes for text operators

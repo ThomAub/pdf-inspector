@@ -7,6 +7,62 @@ use log::debug;
 use lopdf::{Document, Encoding, Object};
 use std::collections::HashMap;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum CMapChoice {
+    Primary,
+    Remapped,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CMapDecisionCache {
+    decisions: HashMap<u32, CMapDecision>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CMapDecision {
+    primary_sample: String,
+    remapped_sample: String,
+    sample_bytes: usize,
+    choice: Option<CMapChoice>,
+}
+
+impl CMapDecisionCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn get_choice(&self, obj_num: u32) -> Option<CMapChoice> {
+        self.decisions.get(&obj_num).and_then(|d| d.choice)
+    }
+
+    pub(crate) fn consider(
+        &mut self,
+        obj_num: u32,
+        primary: &str,
+        remapped: &str,
+        bytes_len: usize,
+    ) -> Option<CMapChoice> {
+        const SAMPLE_TARGET_BYTES: usize = 240;
+
+        let entry = self.decisions.entry(obj_num).or_default();
+        entry.sample_bytes = entry.sample_bytes.saturating_add(bytes_len);
+        entry.primary_sample.push_str(primary);
+        entry.remapped_sample.push_str(remapped);
+
+        if entry.choice.is_none() && entry.sample_bytes >= SAMPLE_TARGET_BYTES {
+            let score_primary = score_text(&entry.primary_sample);
+            let score_remap = score_text(&entry.remapped_sample);
+            entry.choice = if score_remap > score_primary + 5 {
+                Some(CMapChoice::Remapped)
+            } else {
+                Some(CMapChoice::Primary)
+            };
+        }
+
+        entry.choice
+    }
+}
+
 /// Resolve a PDF object reference to an array
 pub(crate) fn resolve_array<'a>(doc: &'a Document, obj: &'a Object) -> Option<&'a Vec<Object>> {
     match obj {
@@ -535,22 +591,52 @@ pub(crate) fn parse_encoding_dictionary(
 /// - FontFile2 or FontFile3 obj_num (for embedded font cmap)
 /// - CIDFont dict obj_num (for predefined CIDSystemInfo-based mapping)
 pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<u32> {
-    // Must be Identity-H or Identity-V encoding
-    let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
-    if encoding != b"Identity-H" && encoding != b"Identity-V" {
-        return None;
-    }
-    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
-    let desc_fonts = resolve_array(doc, desc_fonts_obj)?;
-    if desc_fonts.is_empty() {
-        return None;
-    }
-    let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
-    let font_descriptor_obj = cid_font_dict.get(b"FontDescriptor").ok()?;
-    let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
+    let subtype = font_dict
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok());
 
-    // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF)
-    if let Some(ff_ref) = font_descriptor
+    // Type0 (CID) fonts
+    if subtype == Some(b"Type0") {
+        let encoding = font_dict.get(b"Encoding").ok()?.as_name().ok()?;
+        if encoding != b"Identity-H" && encoding != b"Identity-V" {
+            return None;
+        }
+        let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
+        let desc_fonts = resolve_array(doc, desc_fonts_obj)?;
+        if desc_fonts.is_empty() {
+            return None;
+        }
+        let cid_font_dict = resolve_dict(doc, &desc_fonts[0])?;
+        let font_descriptor_obj = cid_font_dict.get(b"FontDescriptor").ok()?;
+        let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
+
+        // Try FontFile2 (TrueType), then FontFile3 (OpenType/CFF)
+        if let Some(ff_ref) = font_descriptor
+            .get(b"FontFile2")
+            .ok()
+            .and_then(|o| o.as_reference().ok())
+            .or_else(|| {
+                font_descriptor
+                    .get(b"FontFile3")
+                    .ok()
+                    .and_then(|o| o.as_reference().ok())
+            })
+        {
+            return Some(ff_ref.0);
+        }
+
+        // Fallback: use DescendantFonts[0] obj_num (for predefined CIDSystemInfo mapping)
+        if let Object::Reference(r) = &desc_fonts[0] {
+            return Some(r.0);
+        }
+        return None;
+    }
+
+    // Simple fonts: use embedded font file if available
+    let font_descriptor_obj = font_dict.get(b"FontDescriptor").ok()?;
+    let font_descriptor = resolve_dict(doc, font_descriptor_obj)?;
+    font_descriptor
         .get(b"FontFile2")
         .ok()
         .and_then(|o| o.as_reference().ok())
@@ -560,66 +646,135 @@ pub(crate) fn get_font_file2_obj_num(doc: &Document, font_dict: &lopdf::Dictiona
                 .ok()
                 .and_then(|o| o.as_reference().ok())
         })
-    {
-        return Some(ff_ref.0);
-    }
-
-    // Fallback: use DescendantFonts[0] obj_num (for predefined CIDSystemInfo mapping)
-    if let Object::Reference(r) = &desc_fonts[0] {
-        return Some(r.0);
-    }
-
-    None
+        .map(|r| r.0)
 }
 
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(
     obj: &Object,
     current_font: &str,
+    base_font_name: Option<&str>,
     font_cmaps: &FontCMaps,
     font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
     font_encodings: &PageFontEncodings,
     encoding_cache: &HashMap<String, Encoding<'_>>,
+    cmap_decisions: &mut CMapDecisionCache,
 ) -> Option<String> {
     if let Object::String(bytes, _) = obj {
+        let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {
+            // For single-byte CMaps, merge CMap + Differences at the byte level:
+            // try CMap first, then Differences, then Latin-1 fallback per byte.
+            // This prevents partial CMap results from blocking the Differences path.
+            if entry.primary.code_byte_length == 1 {
+                let encoding_map = font_encodings.get(current_font);
+                let lookups = entry.primary.lookup_bytes(bytes);
+                let decoded: String = lookups
+                    .iter()
+                    .filter_map(|&(b, ref cmap_result)| {
+                        // 1. CMap mapped it? Use CMap result
+                        if let Some(s) = cmap_result {
+                            return Some(s.clone());
+                        }
+                        // 2. Differences mapped it? Use Differences result
+                        if let Some(map) = encoding_map {
+                            if let Some(&ch) = map.get(&b) {
+                                return Some(ch.to_string());
+                            }
+                        }
+                        // 3. Printable ASCII/Latin-1 fallback
+                        if b >= 0x20 {
+                            return Some((b as char).to_string());
+                        }
+                        None
+                    })
+                    .collect();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+                return None;
+            }
+
+            // 2-byte CMap: use standard decode_cids path
+            if bytes.len() % 2 == 1 {
+                // Some PDFs emit 1-byte codes even for Type0 fonts; try per-byte lookup
+                let lookups = entry.primary.lookup_bytes(bytes);
+                let decoded: String = lookups
+                    .iter()
+                    .filter_map(|&(_b, ref cmap_result)| cmap_result.clone())
+                    .collect();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+            let decoded_primary = entry.primary.decode_cids(bytes);
+            if let Some(remapped) = entry.remapped.as_ref() {
+                let decoded_remap = remapped.decode_cids(bytes);
+                let decoded_fallback = entry.fallback.as_ref().map(|c| c.decode_cids(bytes));
+
+                if let Some(choice) = cmap_decisions
+                    .get_choice(font_tounicode_refs.get(current_font).copied().unwrap_or(0))
+                {
+                    let decoded = match choice {
+                        CMapChoice::Primary => decoded_primary.clone(),
+                        CMapChoice::Remapped => decoded_remap.clone(),
+                    };
+                    if !decoded.is_empty() {
+                        return Some(decoded);
+                    }
+                }
+
+                let choice = cmap_decisions.consider(
+                    font_tounicode_refs.get(current_font).copied().unwrap_or(0),
+                    &decoded_primary,
+                    &decoded_remap,
+                    bytes.len(),
+                );
+                let mut decoded = match choice {
+                    Some(CMapChoice::Primary) => decoded_primary,
+                    Some(CMapChoice::Remapped) => decoded_remap,
+                    None => choose_best_cmap_decode(decoded_primary, decoded_remap),
+                };
+                if let Some(fb) = decoded_fallback {
+                    let expected = bytes.len() / 2;
+                    let decoded_len = decoded.chars().count();
+                    let prefer_fallback = (!fb.is_empty() && decoded.is_empty())
+                        || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                    if prefer_fallback || score_text(&fb) > score_text(&decoded) + 3 {
+                        decoded = fb;
+                    }
+                }
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            } else if !decoded_primary.is_empty() {
+                if let Some(fb) = entry.fallback.as_ref().map(|c| c.decode_cids(bytes)) {
+                    let expected = bytes.len() / 2;
+                    let decoded_len = decoded_primary.chars().count();
+                    let prefer_fallback = (!fb.is_empty() && decoded_primary.is_empty())
+                        || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                    if prefer_fallback || score_text(&fb) > score_text(&decoded_primary) + 3 {
+                        return Some(fb);
+                    }
+                }
+                return Some(decoded_primary);
+            }
+
+            None
+        };
+
+        if let Some(entry) = inline_cmaps.get(current_font) {
+            if let Some(decoded) = decode_with_entry(entry) {
+                return Some(decoded);
+            }
+        }
+
         // Look up CMap by ToUnicode object reference
         if let Some(&obj_num) = font_tounicode_refs.get(current_font) {
-            if let Some(cmap) = font_cmaps.get_by_obj(obj_num) {
-                // For single-byte CMaps, merge CMap + Differences at the byte level:
-                // try CMap first, then Differences, then Latin-1 fallback per byte.
-                // This prevents partial CMap results from blocking the Differences path.
-                if cmap.code_byte_length == 1 {
-                    let encoding_map = font_encodings.get(current_font);
-                    let lookups = cmap.lookup_bytes(bytes);
-                    let decoded: String = lookups
-                        .iter()
-                        .filter_map(|&(b, ref cmap_result)| {
-                            // 1. CMap mapped it? Use CMap result
-                            if let Some(s) = cmap_result {
-                                return Some(s.clone());
-                            }
-                            // 2. Differences mapped it? Use Differences result
-                            if let Some(map) = encoding_map {
-                                if let Some(&ch) = map.get(&b) {
-                                    return Some(ch.to_string());
-                                }
-                            }
-                            // 3. Printable ASCII/Latin-1 fallback
-                            if b >= 0x20 {
-                                return Some((b as char).to_string());
-                            }
-                            None
-                        })
-                        .collect();
-                    if !decoded.is_empty() {
-                        return Some(decoded);
-                    }
-                } else {
-                    // 2-byte CMap: use standard decode_cids path
-                    let decoded = cmap.decode_cids(bytes);
-                    if !decoded.is_empty() {
-                        return Some(decoded);
-                    }
+            if let Some(entry) = font_cmaps.get_by_obj(obj_num) {
+                if let Some(decoded) = decode_with_entry(entry) {
+                    return Some(decoded);
                 }
             }
         }
@@ -654,6 +809,16 @@ pub(crate) fn extract_text_from_operand(
         // Try to decode using cached font encoding from lopdf
         if let Some(encoding) = encoding_cache.get(current_font) {
             if let Ok(text) = Document::decode_text(encoding, bytes) {
+                if text.contains('\u{FFFD}') {
+                    debug!(
+                        "decode_text produced replacement for font={} bytes_len={}",
+                        current_font,
+                        bytes.len()
+                    );
+                    if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
+                        return Some(symbol_text);
+                    }
+                }
                 return Some(text);
             }
         }
@@ -664,7 +829,19 @@ pub(crate) fn extract_text_from_operand(
                 .chunks_exact(2)
                 .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
                 .collect();
-            return Some(String::from_utf16_lossy(&utf16));
+            let text = String::from_utf16_lossy(&utf16);
+            if text.contains('\u{FFFD}') {
+                debug!(
+                    "utf16 loss produced replacement for font={} bytes_len={}",
+                    current_font,
+                    bytes.len()
+                );
+            }
+            return Some(text);
+        }
+
+        if let Some(symbol_text) = decode_symbol_fallback(bytes, base_font_name) {
+            return Some(symbol_text);
         }
 
         // Latin-1 fallback
@@ -672,4 +849,87 @@ pub(crate) fn extract_text_from_operand(
     } else {
         None
     }
+}
+
+fn decode_symbol_fallback(bytes: &[u8], base_font_name: Option<&str>) -> Option<String> {
+    let name = base_font_name?.to_ascii_lowercase();
+    if !name.contains("symbol") && !name.contains("wingdings") && !name.contains("zapfdingbats") {
+        return None;
+    }
+    let mut out = String::new();
+    for &b in bytes {
+        if b < 0x20 {
+            continue;
+        }
+        if let Some(ch) = char::from_u32(0xF000 + b as u32) {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn choose_best_cmap_decode(primary: String, remapped: String) -> String {
+    if primary.is_empty() {
+        return remapped;
+    }
+    if remapped.is_empty() {
+        return primary;
+    }
+    let score_primary = score_text(&primary);
+    let score_remap = score_text(&remapped);
+    if score_remap > score_primary + 3 {
+        remapped
+    } else {
+        primary
+    }
+}
+
+fn score_text(text: &str) -> i32 {
+    const COMMON_WORDS: [&str; 22] = [
+        "the", "and", "of", "to", "in", "a", "is", "that", "for", "with", "on", "as", "by", "from",
+        "this", "be", "are", "at", "or", "not", "it", "our",
+    ];
+
+    let mut letters = 0i32;
+    let mut spaces = 0i32;
+    let mut digits = 0i32;
+    let mut other = 0i32;
+    let mut word_hits = 0i32;
+
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphabetic() {
+            letters += 1;
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            if !current.is_empty() {
+                if COMMON_WORDS.iter().any(|w| *w == current) {
+                    word_hits += 1;
+                }
+                current.clear();
+            }
+            if ch == ' ' {
+                spaces += 1;
+            } else if ch.is_ascii_digit() {
+                digits += 1;
+            } else if ch.is_control() || ch == '\u{FFFD}' {
+                other += 3;
+            } else {
+                other += 1;
+            }
+        }
+    }
+    if !current.is_empty() && COMMON_WORDS.iter().any(|w| *w == current) {
+        word_hits += 1;
+    }
+
+    let mut score = word_hits * 10 + letters + spaces * 2 + digits - other * 2;
+    if letters > 15 && word_hits == 0 {
+        score -= 15;
+    }
+    score
 }

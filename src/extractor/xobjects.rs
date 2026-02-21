@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::fonts::{
     build_font_encodings, build_font_widths, compute_string_width_ts, extract_text_from_operand,
-    get_font_file2_obj_num, get_operand_bytes,
+    get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
 };
 use super::{get_number, multiply_matrices};
 
@@ -81,6 +81,7 @@ pub(crate) fn extract_form_xobject_text(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    cmap_decisions: &mut CMapDecisionCache,
 ) -> Vec<TextItem> {
     use lopdf::content::Content;
 
@@ -113,6 +114,8 @@ pub(crate) fn extract_form_xobject_text(
         std::collections::HashMap::new();
     let mut font_tounicode_refs: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+    let mut inline_cmaps: std::collections::HashMap<String, crate::tounicode::CMapEntry> =
+        std::collections::HashMap::new();
 
     for (font_name, font_dict) in &form_fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
@@ -122,12 +125,25 @@ pub(crate) fn extract_form_xobject_text(
                 font_base_names.insert(resource_name.clone(), base_name);
             }
         }
-        if let Ok(tounicode) = font_dict.get(b"ToUnicode") {
-            if let Ok(obj_ref) = tounicode.as_reference() {
-                font_tounicode_refs.insert(resource_name, obj_ref.0);
+        match font_dict.get(b"ToUnicode") {
+            Ok(tounicode) => {
+                if let Ok(obj_ref) = tounicode.as_reference() {
+                    font_tounicode_refs.insert(resource_name, obj_ref.0);
+                } else if let Object::Stream(s) = tounicode {
+                    if let Ok(data) = s.decompressed_content() {
+                        if let Some(entry) =
+                            crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
+                        {
+                            inline_cmaps.insert(resource_name, entry);
+                        }
+                    }
+                }
             }
-        } else if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
-            font_tounicode_refs.insert(resource_name, ff2_obj_num);
+            Err(_) => {
+                if let Some(ff2_obj_num) = get_font_file2_obj_num(doc, font_dict) {
+                    font_tounicode_refs.insert(resource_name, ff2_obj_num);
+                }
+            }
         }
     }
 
@@ -221,10 +237,13 @@ pub(crate) fn extract_form_xobject_text(
                     if let Some(text) = extract_text_from_operand(
                         &op.operands[0],
                         &current_font,
+                        font_base_names.get(&current_font).map(|s| s.as_str()),
                         font_cmaps,
                         &font_tounicode_refs,
+                        &inline_cmaps,
                         &font_encodings,
                         &encoding_cache,
+                        cmap_decisions,
                     ) {
                         let combined = multiply_matrices(&text_matrix, parent_ctm);
                         let rendered_size = effective_font_size(current_font_size, &combined);
@@ -357,10 +376,13 @@ pub(crate) fn extract_form_xobject_text(
                                 if let Some(text) = extract_text_from_operand(
                                     element,
                                     &current_font,
+                                    font_base_names.get(&current_font).map(|s| s.as_str()),
                                     font_cmaps,
                                     &font_tounicode_refs,
+                                    &inline_cmaps,
                                     &font_encodings,
                                     &encoding_cache,
+                                    cmap_decisions,
                                 ) {
                                     current_text.push_str(&text);
                                 }
