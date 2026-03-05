@@ -29,10 +29,12 @@ use convert::{merge_continuation_tables, to_markdown_from_lines_with_tables_and_
 /// clear vertical gap separates two groups of items, or an empty vec if the
 /// page has a single-region layout.
 ///
-/// Evaluates all candidate gaps (≥40pt with ≥20 items on each side) and picks
-/// the one with the fewest bounding-box crossings. The crossing count must be
-/// under 2% of total items — this prevents splitting paragraphs whose lines
-/// extend across the gap.
+/// Candidate gaps must be ≥30pt and in the middle 60% of the page's X range.
+/// Items are counted by center position for accurate balance (each side ≥20%).
+/// The candidate with the fewest bounding-box crossings is chosen (must be
+/// under 5% of total items). To reject single wide tables with multiple
+/// column gaps, only pages with one balanced-candidate cluster (within 50pt)
+/// are accepted.
 pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
     if items.len() < 40 {
         return vec![];
@@ -42,15 +44,24 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
     let mut xs: Vec<f32> = items.iter().map(|i| i.x).collect();
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Find all candidate gaps: ≥40pt with ≥20 items on each side
-    let mut candidates: Vec<(f32, usize)> = Vec::new(); // (split_x, gap_pos)
+    // Find all candidate gaps: ≥30pt, in the middle 60% of the X range,
+    // with ≥20 items on each side.
+    let x_min = xs[0];
+    let x_max = *xs.last().unwrap();
+    let x_range = x_max - x_min;
+    let center_lo = x_min + x_range * 0.2;
+    let center_hi = x_min + x_range * 0.8;
+    let mut candidates: Vec<f32> = Vec::new();
     for i in 1..xs.len() {
         let gap = xs[i] - xs[i - 1];
-        let left_count = i;
-        let right_count = xs.len() - i;
-        if gap >= 40.0 && left_count >= 20 && right_count >= 20 {
-            let split_x = (xs[i - 1] + xs[i]) / 2.0;
-            candidates.push((split_x, i));
+        let split_x = (xs[i - 1] + xs[i]) / 2.0;
+        if gap >= 30.0
+            && i >= 20
+            && (xs.len() - i) >= 20
+            && split_x >= center_lo
+            && split_x <= center_hi
+        {
+            candidates.push(split_x);
         }
     }
 
@@ -59,13 +70,18 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
     }
 
     // Pick the candidate with the fewest bounding-box crossings,
-    // but only consider balanced splits (smaller side ≥ 30% of total).
-    let min_side = items.len() * 3 / 10;
+    // but only consider balanced splits (each side ≥ 20% of total items
+    // by center position, which is more accurate than left-edge counting).
+    let min_side = items.len() / 5;
     let mut best_split = 0.0f32;
     let mut best_crossing = usize::MAX;
-    for &(split_x, gap_pos) in &candidates {
-        let left_count = gap_pos;
-        let right_count = xs.len() - gap_pos;
+    for &split_x in &candidates {
+        // Count items by center position for accurate balance check
+        let left_count = items
+            .iter()
+            .filter(|i| i.x + i.width / 2.0 < split_x)
+            .count();
+        let right_count = items.len() - left_count;
         if left_count.min(right_count) < min_side {
             continue;
         }
@@ -83,32 +99,65 @@ pub(crate) fn split_side_by_side(items: &[TextItem]) -> Vec<(f32, f32)> {
         return vec![];
     }
 
-    // Crossing items must be < 2% of total (allows a few spanning headers)
-    let max_crossing = (items.len() / 50).max(2);
+    // Crossing items must be < 5% of total (allows spanning headers/labels)
+    let max_crossing = (items.len() / 20).max(2);
     if best_crossing > max_crossing {
         return vec![];
     }
 
-    let x_min = xs[0];
-    let x_max = *xs.last().unwrap();
+    // Multiple balanced split candidates that are far apart indicate a
+    // multi-column single table. Adjacent candidates (within 20pt) are
+    // treated as the same split point. Side-by-side tables have exactly
+    // one cluster of candidates near the inter-table gap.
+    let mut balanced_positions: Vec<f32> = candidates
+        .iter()
+        .filter(|&&sx| {
+            let lc = items.iter().filter(|i| i.x + i.width / 2.0 < sx).count();
+            let rc = items.len() - lc;
+            lc.min(rc) >= min_side
+        })
+        .copied()
+        .collect();
+    balanced_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    balanced_positions.dedup_by(|a, b| (*a - *b).abs() < 50.0);
+    if balanced_positions.len() > 1 {
+        return vec![];
+    }
 
     vec![(x_min, best_split), (best_split, x_max)]
 }
 
-/// Filter rects to those overlapping an X band.
+/// Filter rects to those mostly contained within an X band.
+///
+/// Excludes rects that extend significantly beyond the band (e.g. page-wide
+/// background stripes spanning both side-by-side tables). A rect must have
+/// at least 70% of its width inside the band to be included.
 pub(crate) fn filter_rects_to_band(
     rects: &[PdfRect],
     page: u32,
     x_lo: f32,
     x_hi: f32,
 ) -> Vec<PdfRect> {
+    let band_width = x_hi - x_lo;
     rects
         .iter()
         .filter(|r| {
             r.page == page && {
                 let rx_min = if r.width >= 0.0 { r.x } else { r.x + r.width };
                 let rx_max = if r.width >= 0.0 { r.x + r.width } else { r.x };
-                rx_max > x_lo && rx_min < x_hi
+                let rw = rx_max - rx_min;
+                // Overlap region
+                let overlap = rx_max.min(x_hi) - rx_min.max(x_lo);
+                if overlap <= 0.0 {
+                    return false;
+                }
+                // Small rects (< 70% of band): require any overlap (cell borders, etc.)
+                // Large rects (≥ 70% of band): require ≥70% of rect inside band
+                if rw < band_width * 0.7 {
+                    true
+                } else {
+                    overlap >= rw * 0.7
+                }
             }
         })
         .cloned()
