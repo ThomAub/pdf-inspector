@@ -37,6 +37,9 @@ pub(crate) fn extract_page_text_items(
     let mut path_subpath_start: Option<(f32, f32)> = None;
     let mut path_current: Option<(f32, f32)> = None;
     let mut pending_lines: Vec<(f32, f32, f32, f32)> = Vec::new();
+    // Completed subpaths (each a vec of line segments) for f/f* rect extraction
+    let mut pending_subpaths: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
+    let mut fill_rects: Vec<PdfRect> = Vec::new();
 
     // Get fonts for encoding
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
@@ -639,6 +642,11 @@ pub(crate) fn extract_page_text_items(
                     }
                     path_current = path_subpath_start;
                 }
+                // Save completed subpath for f/f* rect extraction and clear pending_lines.
+                // The W/W* handler reads from pending_subpaths (last entry) instead.
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
             }
             // ── Path painting operators ──────────────────────────
             "S" | "s" => {
@@ -664,6 +672,7 @@ pub(crate) fn extract_page_text_items(
                         page: page_num,
                     });
                 }
+                pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
             }
@@ -690,11 +699,63 @@ pub(crate) fn extract_page_text_items(
                         page: page_num,
                     });
                 }
+                pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
             }
             "f" | "F" | "f*" => {
-                // fill-only: discard path without emitting lines
+                // fill-only: extract axis-aligned rects from completed subpaths
+                // Also check any un-closed segments still in pending_lines
+                if !pending_lines.is_empty() {
+                    pending_subpaths.push(std::mem::take(&mut pending_lines));
+                }
+                for subpath in pending_subpaths.drain(..) {
+                    // Synthesize closing segment if only 3 segments
+                    let mut segs = subpath;
+                    if segs.len() == 3 {
+                        let (x0, y0, _, _) = segs[0];
+                        let (_, _, ex, ey) = segs[2];
+                        if (ex - x0).abs() > 0.01 || (ey - y0).abs() > 0.01 {
+                            segs.push((ex, ey, x0, y0));
+                        }
+                    }
+                    if segs.len() == 4 {
+                        let mut xs = Vec::with_capacity(8);
+                        let mut ys = Vec::with_capacity(8);
+                        for &(x1, y1, x2, y2) in &segs {
+                            xs.push(x1);
+                            xs.push(x2);
+                            ys.push(y1);
+                            ys.push(y2);
+                        }
+                        let min_x = xs.iter().copied().fold(f32::INFINITY, f32::min);
+                        let max_x = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let min_y = ys.iter().copied().fold(f32::INFINITY, f32::min);
+                        let max_y = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let w = max_x - min_x;
+                        let h = max_y - min_y;
+                        let eps: f32 = 0.5;
+                        let axis_aligned = xs
+                            .iter()
+                            .all(|&x| (x - min_x).abs() < eps || (x - max_x).abs() < eps)
+                            && ys
+                                .iter()
+                                .all(|&y| (y - min_y).abs() < eps || (y - max_y).abs() < eps);
+                        if axis_aligned && w > 1.0 && h > 1.0 {
+                            let x_dev = min_x * ctm[0] + min_y * ctm[2] + ctm[4];
+                            let y_dev = min_x * ctm[1] + min_y * ctm[3] + ctm[5];
+                            let w_dev = w * ctm[0];
+                            let h_dev = h * ctm[3];
+                            fill_rects.push(PdfRect {
+                                x: x_dev,
+                                y: y_dev,
+                                width: w_dev,
+                                height: h_dev,
+                                page: page_num,
+                            });
+                        }
+                    }
+                }
                 pending_lines.clear();
                 path_subpath_start = None;
                 path_current = None;
@@ -702,7 +763,13 @@ pub(crate) fn extract_page_text_items(
             "W" | "W*" => {
                 // Clip operator: check if pending path forms an axis-aligned rectangle.
                 // Many PDFs define table cells as clipping paths instead of stroked rects.
-                let mut segs: Vec<(f32, f32, f32, f32)> = pending_lines.clone();
+                // After `h` closes a subpath, pending_lines is cleared and the subpath
+                // is saved to pending_subpaths. Read from the last subpath entry.
+                let mut segs: Vec<(f32, f32, f32, f32)> = if pending_lines.is_empty() {
+                    pending_subpaths.last().cloned().unwrap_or_default()
+                } else {
+                    pending_lines.clone()
+                };
                 // If only 3 segments, synthesize closing segment back to subpath start
                 if segs.len() == 3 {
                     if let Some((sx, sy)) = path_subpath_start {
@@ -756,6 +823,7 @@ pub(crate) fn extract_page_text_items(
             "n" => {
                 // end path (no-op): discard
                 pending_lines.clear();
+                pending_subpaths.clear();
                 path_subpath_start = None;
                 path_current = None;
             }
@@ -765,8 +833,11 @@ pub(crate) fn extract_page_text_items(
 
     // Only use clipping-path rects when no `re` rects exist on this page,
     // to avoid diluting real table rects with decorative clip regions.
+    // Fill-path rects are third priority: only when both `re` and clip rects are empty.
     if rects.is_empty() && !clip_rects.is_empty() {
         rects = clip_rects;
+    } else if rects.is_empty() && clip_rects.is_empty() && !fill_rects.is_empty() {
+        rects = fill_rects;
     }
 
     let items = super::merge_text_items(items);

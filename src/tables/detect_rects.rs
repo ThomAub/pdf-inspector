@@ -261,6 +261,30 @@ pub fn detect_tables_from_rects(
                 }
             }
         }
+
+        // Row-stripe fallback: when clustering produces no large clusters
+        // (row stripes don't overlap so each is its own cluster of 1),
+        // try all page rects directly as a row-stripe table.
+        // Require ≥15 rects and ≥10 result rows to avoid decorative fill false positives.
+        if tables.is_empty() && clusters.is_empty() && page_rects.len() >= 15 {
+            if let Some(table) = detect_row_stripe_table(items, &page_rects, page) {
+                if table.rows.len() >= 10 {
+                    debug!(
+                        "page {}: row-stripe fallback succeeded ({} rects, {} rows)",
+                        page,
+                        page_rects.len(),
+                        table.rows.len()
+                    );
+                    tables.push(table);
+                } else {
+                    debug!(
+                        "page {}: row-stripe fallback rejected: only {} rows",
+                        page,
+                        table.rows.len()
+                    );
+                }
+            }
+        }
     }
 
     // On rect-sparse pages (≤ 6 rects), a few cell-border rects may define the
