@@ -28,6 +28,7 @@ pub mod extractor;
 pub mod glyph_names;
 pub mod markdown;
 pub mod process_mode;
+pub mod structure_tree;
 pub mod tables;
 pub mod text_utils;
 pub mod tounicode;
@@ -273,20 +274,21 @@ pub fn process_pdf_mem_with_config(
 /// are combined here, but lopdf loads the full doc in `load()` so we extract
 /// page count from it directly to avoid the metadata-only round-trip.
 fn load_document_from_path<P: AsRef<Path>>(path: P) -> Result<(Document, u32), PdfError> {
-    let doc = match Document::load(&path) {
-        Ok(d) => d,
-        Err(ref e) if is_encrypted_lopdf_error(e) => Document::load_with_password(&path, "")?,
-        Err(e) => return Err(e.into()),
-    };
-    let page_count = doc.get_pages().len() as u32;
-    Ok((doc, page_count))
+    let buffer = std::fs::read(&path)?;
+    load_document_from_mem(&buffer)
 }
 
 /// Load a PDF from a memory buffer.
 fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
-    let doc = match Document::load_mem(buffer) {
+    // Fix malformed struct element names before parsing. Some PDF generators
+    // write bare names (/S Code) instead of proper PDF names (/S /Code), which
+    // causes lopdf to silently drop the entire object.
+    let fixed = structure_tree::fix_bare_struct_names(buffer);
+    let buf = fixed.as_ref();
+
+    let doc = match Document::load_mem(buf) {
         Ok(d) => d,
-        Err(ref e) if is_encrypted_lopdf_error(e) => Document::load_mem_with_password(buffer, "")?,
+        Err(ref e) if is_encrypted_lopdf_error(e) => Document::load_mem_with_password(buf, "")?,
         Err(e) => return Err(e.into()),
     };
     let page_count = doc.get_pages().len() as u32;
@@ -350,6 +352,22 @@ fn process_document(
         Some(extracted?)
     };
 
+    // Parse structure tree for tagged PDFs (reuses the loaded document)
+    let struct_roles = structure_tree::StructTree::from_doc(&doc).and_then(|tree| {
+        let page_ids = doc.get_pages();
+        let roles = tree.mcid_to_roles(&page_ids);
+        if roles.is_empty() {
+            None
+        } else {
+            log::debug!(
+                "structure tree: {} pages with MCID roles, {} total MCIDs",
+                roles.len(),
+                tree.mcid_count()
+            );
+            Some(roles)
+        }
+    });
+
     let (markdown, layout, has_encoding_issues) = match extracted {
         Some(((items, rects, lines), page_thresholds)) => {
             let layout = compute_layout_complexity(&items, &rects, &lines);
@@ -363,6 +381,7 @@ fn process_document(
                     &rects,
                     &lines,
                     &page_thresholds,
+                    struct_roles.as_ref(),
                 ))
             };
 

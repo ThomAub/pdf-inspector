@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use crate::structure_tree::StructRole;
 use crate::types::TextLine;
 
 use super::analysis::{
@@ -12,6 +13,50 @@ use super::classify::{format_list_item, is_caption_line, is_list_item, is_monosp
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
 use super::MarkdownOptions;
+
+/// Resolve the dominant structure role for a text line by looking up its items' MCIDs.
+///
+/// Returns the first non-container role found (skipping Document/Part/Sect/Div/NonStruct/Span).
+/// These wrapper roles don't carry useful semantic info for markdown generation.
+fn resolve_line_struct_role(
+    line: &TextLine,
+    struct_roles: &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
+) -> Option<StructRole> {
+    let page_roles = struct_roles.get(&line.page)?;
+    for item in &line.items {
+        if let Some(mcid) = item.mcid {
+            if let Some(role) = page_roles.get(&mcid) {
+                match role {
+                    // Skip container/wrapper roles — not useful for line classification
+                    StructRole::Document
+                    | StructRole::Part
+                    | StructRole::Art
+                    | StructRole::Sect
+                    | StructRole::Div
+                    | StructRole::NonStruct
+                    | StructRole::Span
+                    | StructRole::Private => continue,
+                    _ => return Some(role.clone()),
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Map a StructRole heading variant to a markdown heading level (1–6).
+fn struct_role_heading_level(role: &StructRole) -> Option<usize> {
+    match role {
+        StructRole::H => Some(1), // Generic heading → H1
+        StructRole::H1 => Some(1),
+        StructRole::H2 => Some(2),
+        StructRole::H3 => Some(3),
+        StructRole::H4 => Some(4),
+        StructRole::H5 => Some(5),
+        StructRole::H6 => Some(6),
+        _ => None,
+    }
+}
 
 /// Merge continuation tables that span across page breaks.
 ///
@@ -182,6 +227,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     page_tables: std::collections::HashMap<u32, Vec<(f32, String)>>,
     page_images: std::collections::HashMap<u32, Vec<(f32, String)>>,
     band_split_pages: &HashSet<u32>,
+    struct_roles: Option<
+        &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
+    >,
 ) -> String {
     if lines.is_empty() && page_tables.is_empty() && page_images.is_empty() {
         return String::new();
@@ -215,6 +263,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
+    let mut in_code_block = false;
     let mut prev_had_dot_leaders = false;
     let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
     let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
@@ -233,6 +282,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         if line.page != current_page {
             // Flush current page's remaining tables and images
             if current_page > 0 {
+                if in_code_block {
+                    output.push_str("```\n");
+                    in_code_block = false;
+                }
                 flush_page_tables_and_images(
                     current_page,
                     &page_tables,
@@ -352,7 +405,25 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
         // Detect figure/table captions and source citations
         // These should be on their own line followed by a paragraph break
-        if is_caption_line(plain_trimmed) {
+        let struct_role = struct_roles.and_then(|roles| resolve_line_struct_role(&line, roles));
+
+        // Determine if this line is code (struct-tree or font-based) for block accumulation
+        let is_code_line = struct_role
+            .as_ref()
+            .is_some_and(|r| matches!(r, StructRole::Code))
+            || (options.detect_code && line.items.iter().any(|i| is_monospace_font(&i.font)));
+
+        // Close code block when transitioning to non-code
+        if in_code_block && !is_code_line {
+            output.push_str("```\n");
+            in_code_block = false;
+        }
+
+        if struct_role
+            .as_ref()
+            .is_some_and(|r| matches!(r, StructRole::Caption))
+            || is_caption_line(plain_trimmed)
+        {
             if in_paragraph {
                 output.push_str("\n\n");
                 in_paragraph = false;
@@ -362,27 +433,48 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             continue;
         }
 
-        // Detect headers by font size
-        // Note: Headers typically shouldn't have bold markers since they're already emphasized
-        // Skip very short text (drop caps/labels) and very long text (body paragraphs)
-        if options.detect_headers
+        // Detect headers: structure-tree headings win, then font-size heuristics.
+        // Structure roles ADD headings (e.g. same-size text tagged H2) but do NOT
+        // suppress headings that the font heuristic would detect (some tagged PDFs
+        // mark obvious headings as P or Span).
+        let struct_heading = struct_role.as_ref().and_then(struct_role_heading_level);
+        let heuristic_heading = if options.detect_headers
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            if let Some(header_level) =
-                detect_header_level(line_font_size, base_size, &heading_tiers)
-            {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
-                }
-                let prefix = "#".repeat(header_level);
-                // Use plain text for headers to avoid redundant formatting
-                output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
-                in_list = false;
-                continue;
+            detect_header_level(line_font_size, base_size, &heading_tiers)
+        } else {
+            None
+        };
+
+        if let Some(level) = struct_heading.or(heuristic_heading) {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
             }
+            let prefix = "#".repeat(level);
+            // Use plain text for headers to avoid redundant formatting
+            output.push_str(&format!("{} {}\n\n", prefix, plain_trimmed));
+            in_list = false;
+            continue;
+        }
+
+        // Structure-tree list item (LI only — LBody is a continuation, not a new item)
+        if struct_role
+            .as_ref()
+            .is_some_and(|r| matches!(r, StructRole::LI))
+            && !is_list_item(plain_trimmed)
+        {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
+            output.push_str(&format!("- {}", trimmed));
+            output.push('\n');
+            in_list = true;
+            last_list_x = line.items.first().map(|i| i.x);
+            continue;
         }
 
         // Detect list items
@@ -428,18 +520,32 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             }
         }
 
-        // Detect code blocks by font
-        if options.detect_code {
-            let is_mono = line.items.iter().any(|i| is_monospace_font(&i.font));
-            if is_mono {
-                if in_paragraph {
-                    output.push_str("\n\n");
-                    in_paragraph = false;
-                }
-                // Use plain text for code blocks
-                output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
-                continue;
+        // Structure-tree block quote
+        if struct_role
+            .as_ref()
+            .is_some_and(|r| matches!(r, StructRole::BlockQuote))
+        {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
             }
+            output.push_str(&format!("> {}\n", trimmed));
+            continue;
+        }
+
+        // Code block accumulation (struct-tree Code role or monospace font)
+        if is_code_line {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+            }
+            if !in_code_block {
+                output.push_str("```\n");
+                in_code_block = true;
+            }
+            output.push_str(plain_trimmed);
+            output.push('\n');
+            continue;
         }
 
         // Regular text - join lines within same paragraph with space
@@ -454,6 +560,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         output.push_str(trimmed);
         in_paragraph = true;
         prev_had_dot_leaders = cur_dot_leaders;
+    }
+
+    // Close any trailing code block
+    if in_code_block {
+        output.push_str("```\n");
     }
 
     // Flush current page and any remaining pages with tables/images
@@ -679,4 +790,272 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
     // Clean up and post-process
     clean_markdown(output, &options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structure_tree::StructRole;
+    use crate::types::TextItem;
+    use std::collections::HashMap;
+
+    fn make_item(text: &str, page: u32, mcid: Option<i64>) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x: 72.0,
+            y: 700.0,
+            width: 100.0,
+            height: 12.0,
+            font: "Helvetica".to_string(),
+            font_size: 12.0,
+            page,
+            is_bold: false,
+            is_italic: false,
+            item_type: crate::types::ItemType::Text,
+            mcid,
+        }
+    }
+
+    fn make_line(items: Vec<TextItem>) -> TextLine {
+        let y = items.first().map(|i| i.y).unwrap_or(0.0);
+        let page = items.first().map(|i| i.page).unwrap_or(1);
+        TextLine {
+            items,
+            y,
+            page,
+            adaptive_threshold: 0.10,
+        }
+    }
+
+    #[test]
+    fn test_struct_role_heading() {
+        let lines = vec![
+            make_line(vec![make_item("Introduction", 1, Some(0))]),
+            make_line(vec![{
+                let mut item = make_item("Body text here.", 1, Some(1));
+                item.y = 680.0;
+                item
+            }]),
+        ];
+
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::H1);
+        page_roles.insert(1i64, StructRole::P);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        assert!(
+            md.contains("# Introduction"),
+            "Should have H1 heading: {md}"
+        );
+        assert!(
+            md.contains("Body text here."),
+            "Should have body text: {md}"
+        );
+    }
+
+    #[test]
+    fn test_struct_role_list_item() {
+        let lines = vec![make_line(vec![make_item("First item", 1, Some(0))])];
+
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::LI);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        assert!(
+            md.contains("- First item"),
+            "Should format as list item: {md}"
+        );
+    }
+
+    #[test]
+    fn test_struct_role_blockquote() {
+        let lines = vec![make_line(vec![make_item("Quoted text", 1, Some(0))])];
+
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::BlockQuote);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        assert!(
+            md.contains("> Quoted text"),
+            "Should format as blockquote: {md}"
+        );
+    }
+
+    #[test]
+    fn test_struct_role_heading_levels() {
+        let mcids = vec![
+            (StructRole::H1, "Title"),
+            (StructRole::H2, "Section"),
+            (StructRole::H3, "Subsection"),
+        ];
+
+        let mut lines = Vec::new();
+        let mut page_roles = HashMap::new();
+        for (i, (role, text)) in mcids.iter().enumerate() {
+            let mut item = make_item(text, 1, Some(i as i64));
+            item.y = 700.0 - (i as f32 * 30.0);
+            lines.push(make_line(vec![item]));
+            page_roles.insert(i as i64, role.clone());
+        }
+
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        assert!(md.contains("# Title"), "H1 → #: {md}");
+        assert!(md.contains("## Section"), "H2 → ##: {md}");
+        assert!(md.contains("### Subsection"), "H3 → ###: {md}");
+    }
+
+    #[test]
+    fn test_no_struct_roles_falls_back_to_heuristics() {
+        let mut item = make_item("Big Title", 1, None);
+        item.font_size = 24.0;
+        item.height = 24.0;
+
+        let lines = vec![
+            make_line(vec![item]),
+            make_line(vec![{
+                let mut body = make_item("Normal body text.", 1, None);
+                body.y = 660.0;
+                body
+            }]),
+        ];
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(
+            md.contains("# Big Title"),
+            "Font heuristic should detect heading: {md}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_line_struct_role_skips_containers() {
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::Div);
+        page_roles.insert(1i64, StructRole::H2);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let line = make_line(vec![
+            make_item("Part ", 1, Some(0)),
+            make_item("Title", 1, Some(1)),
+        ]);
+
+        let role = resolve_line_struct_role(&line, &roles);
+        assert_eq!(role, Some(StructRole::H2));
+    }
+
+    #[test]
+    fn test_struct_role_code() {
+        let lines = vec![make_line(vec![make_item("fn main() {}", 1, Some(0))])];
+
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::Code);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        assert!(
+            md.contains("```\nfn main() {}\n```"),
+            "Should format as code block: {md}"
+        );
+    }
+
+    #[test]
+    fn test_struct_role_code_multiline_accumulation() {
+        let mut line1 = make_item("fn main() {", 1, Some(0));
+        line1.y = 700.0;
+        let mut line2 = make_item("    println!(\"hello\");", 1, Some(1));
+        line2.y = 688.0;
+        let mut line3 = make_item("}", 1, Some(2));
+        line3.y = 676.0;
+
+        let lines = vec![
+            make_line(vec![line1]),
+            make_line(vec![line2]),
+            make_line(vec![line3]),
+        ];
+
+        let mut page_roles = HashMap::new();
+        page_roles.insert(0i64, StructRole::Code);
+        page_roles.insert(1i64, StructRole::Code);
+        page_roles.insert(2i64, StructRole::Code);
+        let mut roles = HashMap::new();
+        roles.insert(1u32, page_roles);
+
+        let md = to_markdown_from_lines_with_tables_and_images(
+            lines,
+            MarkdownOptions::default(),
+            HashMap::new(),
+            HashMap::new(),
+            &std::collections::HashSet::new(),
+            Some(&roles),
+        );
+
+        // Should produce a single fenced block, not three separate ones
+        assert!(
+            md.contains("```\nfn main() {\nprintln!(\"hello\");\n}\n```"),
+            "Should accumulate consecutive code lines into one block: {md}"
+        );
+        // Should NOT have adjacent fences
+        assert!(
+            !md.contains("```\n```"),
+            "Should not have adjacent close/open fences: {md}"
+        );
+    }
 }
