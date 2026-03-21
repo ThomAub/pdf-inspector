@@ -1734,7 +1734,7 @@ impl FontCMaps {
             };
             let data = match stream.decompressed_content() {
                 Ok(d) => d,
-                Err(_) => continue,
+                Err(_) => stream.content.clone(),
             };
             if let Some(cmap) = ToUnicodeCMap::parse(&data) {
                 debug!(

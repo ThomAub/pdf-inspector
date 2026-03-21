@@ -75,12 +75,13 @@ pub(crate) fn extract_page_text_items(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    if let Ok(data) = s.decompressed_content() {
-                        if let Some(entry) =
-                            crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
-                        {
-                            inline_cmaps.insert(resource_name, entry);
-                        }
+                    let data = s
+                        .decompressed_content()
+                        .unwrap_or_else(|_| s.content.clone());
+                    if let Some(entry) =
+                        crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
+                    {
+                        inline_cmaps.insert(resource_name, entry);
                     }
                 }
             }
