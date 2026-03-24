@@ -115,6 +115,17 @@ pub(crate) fn extract_page_text_items(
 
     let content = Content::decode(&content_data).map_err(|e| PdfError::Parse(e.to_string()))?;
 
+    const MAX_OPERATIONS: usize = 1_000_000;
+    if content.operations.len() > MAX_OPERATIONS {
+        log::warn!(
+            "page {}: skipping extraction — {} operations exceeds limit ({})",
+            page_num,
+            content.operations.len(),
+            MAX_OPERATIONS
+        );
+        return Ok(((Vec::new(), Vec::new(), Vec::new()), false));
+    }
+
     // Graphics state tracking
     let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0]; // Current Transformation Matrix
     let mut text_rendering_mode: i32 = 0; // 0=fill, 1=stroke, 2=fill+stroke, 3=invisible
@@ -1121,5 +1132,46 @@ mod tests {
         let mut single = vec![rect(1.0, 2.0, 3.0, 4.0, 1)];
         dedup_rects(&mut single);
         assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn test_skip_excessive_operations() {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        let mut doc = lopdf::Document::new();
+
+        // "0 0 m\n" = 6 bytes per op, 1_100_000 ops → ~6.6 MB content stream
+        let ops_bytes = "0 0 m\n".repeat(1_100_000).into_bytes();
+        let stream = Stream::new(dictionary! {}, ops_bytes);
+        let content_id = doc.add_object(Object::Stream(stream));
+
+        let page_dict = dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Resources" => dictionary! {},
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        };
+        let page_id = doc.add_object(page_dict);
+
+        // Register the page so get_page_content can find it
+        let pages_dict = dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        };
+        let pages_id = doc.add_object(pages_dict);
+        let catalog = dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+        };
+        doc.add_object(catalog);
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let result = extract_page_text_items(&doc, page_id, 1, &font_cmaps, false).unwrap();
+        let ((items, rects, lines), _has_gid) = result;
+        assert!(items.is_empty());
+        assert!(rects.is_empty());
+        assert!(lines.is_empty());
     }
 }
