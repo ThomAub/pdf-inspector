@@ -288,7 +288,9 @@ fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
 
     let doc = match Document::load_mem(buf) {
         Ok(d) => d,
-        Err(ref e) if is_encrypted_lopdf_error(e) => Document::load_mem_with_password(buf, "")?,
+        Err(ref e) if is_encrypted_lopdf_error(e) => {
+            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))?
+        }
         Err(e) => return Err(e.into()),
     };
     let page_count = doc.get_pages().len() as u32;

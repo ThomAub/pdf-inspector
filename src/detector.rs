@@ -144,7 +144,7 @@ pub fn detect_pdf_type_mem_with_config(
     let doc = match Document::load_mem(buffer) {
         Ok(d) => d,
         Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_password(buffer, "")?
+            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
         }
         Err(e) => return Err(e.into()),
     };

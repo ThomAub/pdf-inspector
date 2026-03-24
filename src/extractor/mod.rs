@@ -52,7 +52,7 @@ pub fn extract_text_mem(buffer: &[u8]) -> Result<String, PdfError> {
     let doc = match Document::load_mem(buffer) {
         Ok(d) => d,
         Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_password(buffer, "")?
+            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
         }
         Err(e) => return Err(e.into()),
     };
@@ -127,7 +127,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     let doc = match Document::load_mem(buffer) {
         Ok(d) => d,
         Err(ref e) if crate::is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_password(buffer, "")?
+            Document::load_mem_with_options(buffer, lopdf::LoadOptions::with_password(""))?
         }
         Err(e) => return Err(e.into()),
     };
