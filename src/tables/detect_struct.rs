@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use log::debug;
+
 use crate::structure_tree::StructTable;
 use crate::types::TextItem;
 
@@ -47,6 +49,13 @@ pub fn detect_tables_from_struct_tree(
                     .any(|cell| cell.mcids.iter().any(|&(_, p)| p == page))
             })
             .collect();
+
+        debug!(
+            "page {}: struct table has {} rows on this page (from {} total)",
+            page,
+            page_rows.len(),
+            st.rows.len()
+        );
 
         if page_rows.len() < 2 {
             continue;
@@ -121,7 +130,21 @@ pub fn detect_tables_from_struct_tree(
         }
 
         // Reject if too few cells matched (stale structure tree)
-        if total_cells == 0 || (matched_cells as f32 / total_cells as f32) < 0.3 {
+        let coverage = if total_cells > 0 {
+            matched_cells as f32 / total_cells as f32
+        } else {
+            0.0
+        };
+        debug!(
+            "page {}: struct table {}x{}, {}/{} cells matched ({:.0}%)",
+            page,
+            page_rows.len(),
+            num_cols,
+            matched_cells,
+            total_cells,
+            coverage * 100.0
+        );
+        if total_cells == 0 || coverage < 0.3 {
             continue;
         }
 

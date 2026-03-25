@@ -678,10 +678,20 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
                 }
             }
 
-            // 1. Rect-based detection first (well-tested, high precision)
+            // 1. Rect-based detection (always runs; struct-tree claims prevent
+            //    double-counting via table_items but rect may find additional tables)
             let (rect_tables, hint_regions) =
                 detect_tables_from_rects(band_items, band_rects, page);
             for table in &rect_tables {
+                // Skip rect tables that overlap with struct-tree claimed items
+                if !rect_claimed.is_empty()
+                    && table
+                        .item_indices
+                        .iter()
+                        .any(|idx| rect_claimed.contains(idx))
+                {
+                    continue;
+                }
                 for &idx in &table.item_indices {
                     rect_claimed.insert(idx);
                     if let Some(&page_idx) = band_index_map.get(idx) {
