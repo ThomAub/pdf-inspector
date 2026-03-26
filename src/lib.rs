@@ -520,6 +520,27 @@ fn process_document(
         pages_needing_ocr.sort_unstable();
     }
 
+    // Detect sparse extraction: when a TEXT-BASED PDF produces very few
+    // characters per page, the text is likely embedded in images/forms
+    // that need OCR.  Flag all pages for OCR in this case.
+    // Only check when markdown was actually generated (not in Analyze mode).
+    if pdf_type == PdfType::TextBased
+        && page_count > 0
+        && pages_needing_ocr.is_empty()
+        && markdown.is_some()
+    {
+        let md_len = markdown.as_ref().map_or(0, |m| m.len());
+        let chars_per_page = md_len as f32 / page_count as f32;
+        if chars_per_page < 50.0 && md_len < 500 {
+            log::debug!(
+                "sparse extraction: {:.0} chars/page — recommending OCR for all {} pages",
+                chars_per_page,
+                page_count
+            );
+            pages_needing_ocr = (1..=page_count).collect();
+        }
+    }
+
     let markdown = if all_gid {
         log::debug!(
             "all {} pages have gid-encoded fonts — suppressing markdown output",
@@ -622,6 +643,7 @@ fn is_cid_garbage(text: &str) -> bool {
     }
     let mut total = 0usize;
     let mut c1_control = 0usize;
+    let mut high_latin = 0usize;
     for ch in text.chars() {
         if ch.is_whitespace() {
             continue;
@@ -631,9 +653,25 @@ fn is_cid_garbage(text: &str) -> bool {
         if ('\u{0080}'..='\u{009F}').contains(&ch) {
             c1_control += 1;
         }
+        // High Latin-1 (U+00A0–U+00FF) — legitimate in Western European text
+        // but when combined with ASCII in CID passthrough, indicates mojibake
+        // from CID values being misinterpreted as Latin-1 characters.
+        if ('\u{00A0}'..='\u{00FF}').contains(&ch) {
+            high_latin += 1;
+        }
+    }
+    if total < 5 {
+        return false;
     }
     // If ≥5% of non-whitespace chars are C1 controls, it's garbage
-    total >= 20 && c1_control * 20 >= total
+    if c1_control * 20 >= total {
+        return true;
+    }
+    // If ≥40% of non-whitespace chars are high Latin-1 AND the text has few
+    // ASCII letters, it's likely CID-as-Latin-1 mojibake (Japanese/CJK PDFs
+    // where CID values 0x80-0xFF become accented Latin characters).
+    let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    high_latin * 5 >= total * 2 && ascii_letters * 3 < total
 }
 
 /// Analyse extracted items and rects for layout complexity.
