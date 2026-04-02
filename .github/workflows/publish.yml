@@ -76,24 +76,56 @@ jobs:
         with:
           path: napi/artifacts
 
-      - name: Move artifacts
-        run: bunx napi artifacts --dir napi/artifacts --napi-dir napi
-        working-directory: napi
-
-      - name: List packages
-        run: ls -R npm/
-        working-directory: napi
-
-      - name: Publish
+      - name: Prepare and publish
         working-directory: napi
         run: |
-          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
-          echo "@firecrawl:registry=https://npm.pkg.github.com" >> .npmrc
-          bunx napi prepublish -t npm
-          npm publish --access public
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > ~/.npmrc
+          echo "@firecrawl:registry=https://npm.pkg.github.com" >> ~/.npmrc
+
+          VERSION=$(node -p "require('./package.json').version")
+
+          # Create platform package dirs and package.json files
+          mkdir -p npm/linux-x64-gnu npm/darwin-arm64
+
+          cat > npm/linux-x64-gnu/package.json << PKGEOF
+          {
+            "name": "@firecrawl/pdf-inspector-js-linux-x64-gnu",
+            "version": "${VERSION}",
+            "os": ["linux"],
+            "cpu": ["x64"],
+            "main": "pdf-inspector.linux-x64-gnu.node",
+            "files": ["pdf-inspector.linux-x64-gnu.node"],
+            "license": "MIT",
+            "repository": { "type": "git", "url": "https://github.com/firecrawl/pdf-inspector" },
+            "publishConfig": { "registry": "https://npm.pkg.github.com", "access": "public" }
+          }
+          PKGEOF
+
+          cat > npm/darwin-arm64/package.json << PKGEOF
+          {
+            "name": "@firecrawl/pdf-inspector-js-darwin-arm64",
+            "version": "${VERSION}",
+            "os": ["darwin"],
+            "cpu": ["arm64"],
+            "main": "pdf-inspector.darwin-arm64.node",
+            "files": ["pdf-inspector.darwin-arm64.node"],
+            "license": "MIT",
+            "repository": { "type": "git", "url": "https://github.com/firecrawl/pdf-inspector" },
+            "publishConfig": { "registry": "https://npm.pkg.github.com", "access": "public" }
+          }
+          PKGEOF
+
+          # Move binaries into platform dirs
+          cp artifacts/bindings-x86_64-unknown-linux-gnu/*.node npm/linux-x64-gnu/
+          cp artifacts/bindings-aarch64-apple-darwin/*.node npm/darwin-arm64/
+
+          echo "=== Package contents ==="
+          ls -R npm/
+
+          # Publish platform packages first, then main package
           for dir in npm/*/; do
-            if [ -f "$dir/package.json" ]; then
-              echo "Publishing $dir"
-              (cd "$dir" && npm publish --access public)
-            fi
+            echo "Publishing $dir"
+            (cd "$dir" && npm publish --access public)
           done
+          echo "Publishing main package"
+          npm publish --access public
