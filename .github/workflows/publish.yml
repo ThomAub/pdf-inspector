@@ -6,7 +6,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  id-token: write
 
 jobs:
   build:
@@ -79,12 +79,10 @@ jobs:
       - name: Collect binaries and publish
         working-directory: napi
         run: |
-          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
-
           # Copy all .node binaries into the package directory
           cp artifacts/bindings-*/*.node .
 
           echo "=== Package contents ==="
           ls -la *.node index.js index.d.ts
 
-          npm publish --access public
+          npm publish --access public --provenance
