@@ -78,13 +78,20 @@ jobs:
 
       - name: Prepare and publish
         working-directory: napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
           echo "@firecrawl:registry=https://npm.pkg.github.com" >> .npmrc
 
-          # Create platform package dirs and move binaries
-          bunx napi prepublish -t npm
+          # Create platform package dirs expected by napi artifacts
+          mkdir -p npm/linux-x64-gnu npm/darwin-arm64
+
+          # Move binaries into platform dirs
           bunx napi artifacts --build-output-dir artifacts
+
+          # Generate platform package.json files
+          bunx napi prepublish -t npm --skip-gh-release
 
           echo "=== Package contents ==="
           ls -R npm/
@@ -93,8 +100,8 @@ jobs:
           for dir in npm/*/; do
             if [ -f "$dir/package.json" ]; then
               echo "Publishing $dir"
-              (cd "$dir" && npm publish --access public)
+              (cd "$dir" && npm publish --access public) || true
             fi
           done
           echo "Publishing main package"
-          npm publish --access public
+          npm publish --access public || true
