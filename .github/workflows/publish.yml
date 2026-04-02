@@ -1,0 +1,99 @@
+name: Publish npm package
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            napi/target/
+          key: ${{ runner.os }}-cargo-napi-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-napi-
+
+      - name: Install dependencies
+        working-directory: napi
+        run: bun install
+
+      - name: Build native addon
+        working-directory: napi
+        run: bunx napi build --platform --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: napi/*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to GitHub Packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: napi
+        run: bun install
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: napi/artifacts
+
+      - name: Move artifacts
+        run: bunx napi artifacts --dir napi/artifacts --napi-dir napi
+        working-directory: napi
+
+      - name: List packages
+        run: ls -R npm/
+        working-directory: napi
+
+      - name: Publish
+        working-directory: napi
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" > .npmrc
+          echo "@firecrawl:registry=https://npm.pkg.github.com" >> .npmrc
+          bunx napi prepublish -t npm
+          npm publish --access public
+          for dir in npm/*/; do
+            if [ -f "$dir/package.json" ]; then
+              echo "Publishing $dir"
+              (cd "$dir" && npm publish --access public)
+            fi
+          done
