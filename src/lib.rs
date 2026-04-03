@@ -344,11 +344,15 @@ pub fn extract_text_in_regions_mem(
 ) -> Result<Vec<PageRegionResult>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let font_cmaps = FontCMaps::from_doc(&doc);
     let pages = doc.get_pages();
 
-    // Build a set of pages we need to extract
-    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect(); // to 1-indexed
+    // Build a set of pages we need to extract (1-indexed for lopdf)
+    let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
+
+    // Fast mode: skip expensive TrueType font fallback parsing.
+    // Fonts that can't be decoded from ToUnicode alone will produce empty/garbage
+    // text, triggering needs_ocr=true → GPU OCR fallback in the pipeline.
+    let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
 
     // Extract text items for needed pages only
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
@@ -451,7 +455,7 @@ fn obj_to_f32(obj: &lopdf::Object) -> Option<f32> {
 
 /// Collect text items that fall within a region bbox (top-left origin, PDF points)
 /// and return them as a single string in reading order.
-fn collect_text_in_region(
+pub fn collect_text_in_region(
     items: &[TextItem],
     rx1: f32,
     ry1: f32,
