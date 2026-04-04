@@ -6,8 +6,8 @@ use crate::structure_tree::StructRole;
 use crate::types::TextLine;
 
 use super::analysis::{
-    calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold, detect_header_level,
-    has_dot_leaders,
+    bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
+    detect_header_level, has_dot_leaders,
 };
 use super::classify::{format_list_item, is_caption_line, is_list_item, is_monospace_font};
 use super::postprocess::clean_markdown;
@@ -443,7 +443,24 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && plain_trimmed.split_whitespace().count() <= 15
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
-            detect_header_level(line_font_size, base_size, &heading_tiers)
+            detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
+                // Bold-only lines at body font size that are standalone (paragraph break
+                // before them) are likely section headings. Require ≥3 words to avoid
+                // promoting short labels/field names. Exclude lines ending with colon
+                // (labels like "Table I:") or that are too short.
+                let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
+                let word_count = plain_trimmed.split_whitespace().count();
+                // Reject lines ending with colon (labels like "Table:") —
+                // strip trailing non-colon punctuation first (e.g. ":*" → ":")
+                let stripped =
+                    plain_trimmed.trim_end_matches(|c: char| c != ':' && !c.is_alphanumeric());
+                let ends_with_colon = stripped.ends_with(':');
+                if all_bold && !in_paragraph && word_count >= 3 && !ends_with_colon {
+                    Some(bold_heading_level(&heading_tiers))
+                } else {
+                    None
+                }
+            })
         } else {
             None
         };
@@ -699,7 +716,19 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         {
             let line_font_size = line.items.first().map(|i| i.font_size).unwrap_or(base_size);
             if let Some(header_level) =
-                detect_header_level(line_font_size, base_size, &heading_tiers)
+                detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
+                    let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
+                    let word_count = plain_trimmed.split_whitespace().count();
+                    let ends_with_colon = plain_trimmed
+                        .trim_end_matches(|c: char| !c.is_alphanumeric())
+                        .ends_with(':')
+                        || plain_trimmed.ends_with(':');
+                    if all_bold && !in_paragraph && word_count >= 3 && !ends_with_colon {
+                        Some(bold_heading_level(&heading_tiers))
+                    } else {
+                        None
+                    }
+                })
             {
                 if in_paragraph {
                     output.push_str("\n\n");

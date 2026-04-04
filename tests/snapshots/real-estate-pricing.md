@@ -22,7 +22,9 @@ R E V I E W 8 5
 
 **Figure 2:** Capratespreadsover10-yearTreasury
 
-**Basis Points -200** -400
+## Basis Points -200
+
+-400
 
 -600
 
@@ -36,7 +38,9 @@ R E V I E W 8 5
 
 **Table II: Correlationsofspreadsbypropertytype**
 
-**Correlation of Cap Rate Spreads Over Treasury** **Multifamily Industrial CBD Office**
+## Correlation of Cap Rate Spreads Over Treasury
+
+## Multifamily Industrial CBD Office
 
 ||Multifamily|Industrial|CBD Office|
 |---|---|---|---|

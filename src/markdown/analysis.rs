@@ -60,6 +60,18 @@ pub(crate) fn calculate_font_stats(lines: &[TextLine]) -> FontStats {
     FontStats { most_common_size }
 }
 
+/// Determine the heading level for a bold-only line that didn't meet the font-size
+/// threshold.  These are common in academic papers where section headings are bold
+/// at the same size as body text.
+///
+/// Returns a level below the lowest font-size tier (or H2 when no tiers exist).
+pub(crate) fn bold_heading_level(heading_tiers: &[f32]) -> usize {
+    let level = heading_tiers.len() + 1;
+    // Clamp to 1..=6 — if no font-size tiers, bold headings become H2
+    // (H1 is reserved for titles which are typically larger)
+    level.clamp(2, 6)
+}
+
 /// Detect TOC-style lines that contain dot leaders (e.g., "Section Name .... 42").
 /// These lines should never be joined with adjacent lines into a paragraph.
 /// Handles both consecutive dots ("....") and spaced dots ("...   ...").

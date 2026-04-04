@@ -513,6 +513,7 @@ pub fn collect_text_in_region(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_text_in_region_with_options(
     items: &[TextItem],
     rx1: f32,
