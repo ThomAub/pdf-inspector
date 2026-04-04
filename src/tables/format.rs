@@ -112,10 +112,14 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         // header like "Category No. 03 - ...") — these are spanning headers,
         // not overflow from the previous row.
         let has_long_spanning_cell = non_first_cells.len() == 1 && non_first_cells[0].len() > 15;
+        // Rows filling most columns with short values are header or data rows,
+        // not text overflow (e.g. "UR | SC | ST | OBC | EWS" column headers).
+        let looks_like_header_row = non_first_cells.len() >= 3 && avg_cell_len <= 10.0;
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
             && !is_short_subheader
             && !looks_like_data_row
+            && !looks_like_header_row
             && !has_long_spanning_cell
             && cleaned.len() > 1;
 
