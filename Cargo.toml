@@ -17,7 +17,7 @@ crate-type = ["lib", "cdylib"]
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
 
 # PDF parsing
-lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "052674053814a9f4897af94f0b8e46a545c9b329", features = ["rayon"] }
+lopdf = { git = "https://github.com/J-F-Liu/lopdf", rev = "7a05512d831415b1f2b1ce522391d6beab8a1284", features = ["rayon"] }
 
 # Error handling
 thiserror = "2.0"
