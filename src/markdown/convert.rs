@@ -446,16 +446,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             detect_header_level(line_font_size, base_size, &heading_tiers).or_else(|| {
                 // Bold-only lines at body font size that are standalone (paragraph break
                 // before them) are likely section headings. Require ≥3 words to avoid
-                // promoting short labels/field names. Exclude lines ending with colon
-                // (labels like "Table I:") or that are too short.
+                // promoting short labels/field names.
                 let all_bold = !line.items.is_empty() && line.items.iter().all(|i| i.is_bold);
                 let word_count = plain_trimmed.split_whitespace().count();
-                // Reject lines ending with colon (labels like "Table:") —
-                // strip trailing non-colon punctuation first (e.g. ":*" → ":")
-                let stripped =
-                    plain_trimmed.trim_end_matches(|c: char| c != ':' && !c.is_alphanumeric());
-                let ends_with_colon = stripped.ends_with(':');
-                if all_bold && !in_paragraph && word_count >= 3 && !ends_with_colon {
+                if all_bold && !in_paragraph && word_count >= 3 {
                     Some(bold_heading_level(&heading_tiers))
                 } else {
                     None

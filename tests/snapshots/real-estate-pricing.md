@@ -8,7 +8,9 @@
 
 **Table I: Cap rate correlations**
 
-**Cap Rate Correlation With:*** **BBB Corp** **10-Year Bond Yield S&P Dividend** **Treasury (10-15 yr) Yield** Multifamily 0.187 0.771 0.068 Industrial-0.221 0.748-0.307 CBD Office-0.449 0.694-0.458 Retail-0.181 0.649-02.58
+## Cap Rate Correlation With:*
+
+**BBB Corp** **10-Year Bond Yield S&P Dividend** **Treasury (10-15 yr) Yield** Multifamily 0.187 0.771 0.068 Industrial-0.221 0.748-0.307 CBD Office-0.449 0.694-0.458 Retail-0.181 0.649-02.58
 
 * Based on 25 years of data for the 10-yrT & S&P DivYld; and 14 years for BBB.
 **Figure 1:** NCREIF cap rates vs. 10-yearTreasury
