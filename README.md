@@ -22,7 +22,7 @@ Evaluated on the [opendataloader-bench](https://github.com/opendataloader-projec
 
 | Engine | Overall | Reading Order (NID) | Tables (TEDS) | Headings (MHS) | Speed (200 docs) |
 |---|---|---|---|---|---|
-| pdf-inspector | 0.77 | 0.87 | 0.52 | 0.56 | 4s |
+| pdf-inspector | 0.77 | 0.87 | 0.52 | 0.58 | 4s |
 | opendataloader | 0.84 | 0.91 | 0.49 | 0.74 | 11s |
 | pymupdf4llm | 0.73 | 0.89 | 0.40 | 0.41 | 18s |
 | markitdown | 0.58 | 0.88 | 0.00 | 0.00 | 8s |
