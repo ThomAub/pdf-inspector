@@ -569,10 +569,20 @@ pub fn extract_tables_in_regions_mem(
                         needs_ocr: true,
                     });
                 } else {
-                    let needs_ocr =
-                        is_garbage_text(&md) || is_cid_garbage(&md) || detect_encoding_issues(&md);
+                    // needs_ocr fires on any of:
+                    //   - garbage text (non-alphanumeric heavy)
+                    //   - CID/Latin-1 mojibake
+                    //   - encoding issues (U+FFFD, dollar-as-space)
+                    //   - structural giveaways that the table is partial /
+                    //     mis-detected (numeric "header", empty header cells,
+                    //     duplicate header cells). Caught GLM-OCR-as-baseline
+                    //     scoring 0 TEDS on real prod tables in eval.
+                    let needs_ocr = is_garbage_text(&md)
+                        || is_cid_garbage(&md)
+                        || detect_encoding_issues(&md)
+                        || looks_like_partial_table(&md);
                     page_results.push(RegionText {
-                        text: md,
+                        text: if needs_ocr { String::new() } else { md },
                         needs_ocr,
                     });
                 }
@@ -1188,6 +1198,185 @@ fn is_cid_garbage(text: &str) -> bool {
     // where CID values 0x80-0xFF become accented Latin characters).
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+}
+
+/// Detect markdown tables with suspicious structure that suggest the heuristic
+/// missed/mangled rows or columns. Returns true when the caller should treat
+/// the result as `needs_ocr` and fall back to GPU OCR.
+///
+/// Catches three failure modes observed in production:
+///
+/// 1. **Header row looks like a data row** — first row starts with a numeric
+///    value (e.g. `|2|...`), suggesting we missed the actual header above it.
+///    Real headers almost never start with a bare number.
+///
+/// 2. **Header has empty cells in a multi-column table** — e.g.
+///    `|Position||Administration|Administration|` (3+ cols, ≥1 empty cell).
+///    Indicates poor column boundary detection.
+///
+/// 3. **Header has duplicate non-empty cells** in a multi-column table —
+///    e.g. `Administration|Administration` appearing as adjacent cells means
+///    we collapsed multi-line headers wrong.
+///
+/// Conservative by design: a few false positives (perfectly fine tables flagged)
+/// just mean we run GPU OCR which is the existing safe path.
+fn looks_like_partial_table(markdown: &str) -> bool {
+    let lines: Vec<&str> = markdown.lines().filter(|l| l.starts_with('|')).collect();
+    if lines.len() < 2 {
+        return false;
+    }
+    // Header is the first pipe-line; separator is the second
+    let header_line = lines[0];
+    let separator_line = lines.get(1).copied().unwrap_or("");
+    let is_separator = |l: &str| l.chars().all(|c| matches!(c, '|' | '-' | ' '));
+    if !is_separator(separator_line) {
+        // No separator after the first line — not a well-formed pipe-table.
+        // table_to_markdown always emits one when it returns content, so this
+        // shouldn't happen in practice. If it does, fall through to OCR.
+        return true;
+    }
+
+    // Parse header cells: split on '|', drop the leading/trailing empty pieces
+    let cells: Vec<&str> = header_line.split('|').map(|s| s.trim()).collect::<Vec<_>>();
+    // The first and last items are always empty (string starts and ends with '|')
+    if cells.len() < 3 {
+        return false;
+    }
+    let header_cells: Vec<&str> = cells[1..cells.len() - 1].to_vec();
+    let n_cols = header_cells.len();
+    if n_cols < 2 {
+        // Single-column tables are usually lists/keys, not tables. Keep them
+        // (caller can decide), but multi-column header checks below don't
+        // apply.
+        return false;
+    }
+
+    // Failure mode 1: header starts with a bare number (likely we missed
+    // the real header row above)
+    if let Some(first) = header_cells.first() {
+        let trimmed = first.trim();
+        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+
+    // Failure mode 2: header has empty cells in a multi-column table
+    let empty_count = header_cells.iter().filter(|c| c.is_empty()).count();
+    if n_cols >= 3 && empty_count >= 1 {
+        return true;
+    }
+
+    // Failure mode 3: header has duplicate non-empty cells
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for cell in &header_cells {
+        if cell.is_empty() {
+            continue;
+        }
+        if !seen.insert(cell) {
+            return true;
+        }
+    }
+
+    // Failure mode 4: first data row has many empty cells in a multi-column
+    // table. Real tables rarely have a leading row with most cells blank;
+    // when this happens it usually means the heuristic split a multi-row
+    // header (e.g. "Position\nAdministration (1986-1992) | Administration
+    // (1992-1998)") into a single-row header + a sparse data row.
+    if let Some(first_data_line) = lines.get(2) {
+        let data_cells: Vec<&str> = first_data_line
+            .split('|')
+            .map(|s| s.trim())
+            .collect::<Vec<_>>();
+        if data_cells.len() >= 3 {
+            let data_inner = &data_cells[1..data_cells.len() - 1];
+            let empty_data = data_inner.iter().filter(|c| c.is_empty()).count();
+            // ≥3 cols, and a third or more of cells in the first data row
+            // are empty → very likely we mis-split a multi-row header.
+            if n_cols >= 3 && empty_data * 3 >= n_cols {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod looks_like_partial_table_tests {
+    use super::looks_like_partial_table;
+
+    #[test]
+    fn good_table_passes() {
+        let md = "|Name|Year|Country|\n|---|---|---|\n|Alice|2020|US|\n|Bob|2021|UK|";
+        assert!(
+            !looks_like_partial_table(md),
+            "should not flag well-formed table"
+        );
+    }
+
+    #[test]
+    fn header_starting_with_number_is_partial() {
+        // Heuristic missed the actual header row above
+        let md = "|2|Cambodian Women for Peace|9,835|\n|---|---|---|\n|3|Association|711|";
+        assert!(looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn header_with_empty_cells_in_3col_is_partial() {
+        // Empty cell in 3+ column header → bad column detection
+        let md =
+            "|Position||Administration|Administration|\n|---|---|---|---|\n|Senate|24|8.3|16.7|";
+        assert!(looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn header_with_duplicate_cells_is_partial() {
+        // Duplicate "Administration" → collapsed multi-line header wrong
+        let md =
+            "|Position|Administration|Administration|Notes|\n|---|---|---|---|\n|Senate|24|16|x|";
+        assert!(looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn two_column_with_one_empty_cell_passes() {
+        // Many real two-column tables have key-only rows; don't penalise.
+        let md = "|Key||\n|---|---|\n|Alice|123|\n|Bob|456|";
+        // Header "Key|" has one empty cell but only 2 cols total — keep it.
+        assert!(!looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn single_column_table_is_kept() {
+        // Single-column "tables" are common (lists). Caller can decide; we
+        // don't second-guess based on column count alone.
+        let md = "|Item|\n|---|\n|First|\n|Second|";
+        assert!(!looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn no_table_at_all_returns_true() {
+        // table_to_markdown should never produce this, but defensive — if
+        // there's no separator, treat as not-a-table.
+        let md = "Just some text\nWith multiple lines";
+        // No lines start with '|' so we return false (no header to inspect).
+        assert!(!looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn first_data_row_with_many_empty_cells_is_partial() {
+        // Multi-row header collapsed to single-row → first "data row" has
+        // most cells empty (the actual sub-header values).
+        let md = "|Government|No. of Seats|Aquino|Ramos|\n|---|---|---|---|\n|Position|||(1986-1992)|\n|Senate|24|8.3|16.7|";
+        assert!(looks_like_partial_table(md));
+    }
+
+    #[test]
+    fn first_data_row_with_one_empty_cell_in_4col_passes() {
+        // Real data rows can have one empty cell (e.g. missing value);
+        // only flag when ≥1/3 of cells are empty.
+        let md = "|A|B|C|D|\n|---|---|---|---|\n|x|y||z|\n|p|q|r|s|";
+        assert!(!looks_like_partial_table(md));
+    }
 }
 
 /// Analyse extracted items and rects for layout complexity.
