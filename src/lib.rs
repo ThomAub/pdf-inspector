@@ -399,7 +399,7 @@ pub fn extract_text_in_regions_mem(
         let page_1idx = page_0idx + 1;
         let items = items_by_page.get(&page_1idx);
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
-        let page_has_gid = gid_pages.contains(&page_1idx);
+        let _page_has_gid = gid_pages.contains(&page_1idx);
         let adaptive_threshold = page_thresholds.get(&page_1idx).copied().unwrap_or(0.10);
         let coords = if rotated_pages.contains(&page_1idx) {
             RegionCoordSpace::Rotated90Ccw
@@ -506,7 +506,7 @@ pub fn extract_tables_in_regions_mem(
         let page_1idx = page_0idx + 1;
         let items = items_by_page.get(&page_1idx);
         let page_h = page_heights.get(&page_1idx).copied().unwrap_or(792.0);
-        let page_has_gid = gid_pages.contains(&page_1idx);
+        let _page_has_gid = gid_pages.contains(&page_1idx);
         let coords = if rotated_pages.contains(&page_1idx) {
             RegionCoordSpace::Rotated90Ccw
         } else {
@@ -1377,8 +1377,9 @@ fn looks_like_partial_table_ex(markdown: &str, layout_assisted: bool) -> bool {
     false
 }
 
-/// Original strict validation (no layout assistance). Used by full-page
-/// extraction where the table boundary is heuristic-detected.
+/// Original strict validation (no layout assistance). Used by tests and
+/// full-page extraction paths that don't have layout model assistance.
+#[cfg(test)]
 fn looks_like_partial_table(markdown: &str) -> bool {
     looks_like_partial_table_ex(markdown, false)
 }
