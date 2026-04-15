@@ -55,12 +55,12 @@ print(result.markdown)   # Markdown string or None
 ### Node.js
 
 ```bash
-npm install @firecrawl/pdf-inspector-js
+npm install firecrawl-pdf-inspector
 ```
 
 ```javascript
 import { readFileSync } from 'fs';
-import { processPdf, classifyPdf } from '@firecrawl/pdf-inspector-js';
+import { processPdf, classifyPdf } from 'firecrawl-pdf-inspector';
 
 const result = processPdf(readFileSync('document.pdf'));
 console.log(result.pdfType);   // "TextBased", "Scanned", "ImageBased", "Mixed"
