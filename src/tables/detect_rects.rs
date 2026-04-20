@@ -1037,12 +1037,7 @@ fn try_build_grid(
         (columns, cells)
     };
 
-    GridResult::Ok(Table {
-        columns,
-        rows,
-        cells,
-        item_indices,
-    })
+    GridResult::Ok(Table::new(columns, rows, cells, item_indices))
 }
 
 /// Deduplicate nearby edge values within a tolerance, returning sorted unique edges.
@@ -1442,12 +1437,7 @@ fn detect_row_stripe_table(
         content_ratio * 100.0
     );
 
-    Some(Table {
-        columns: column_centers,
-        rows: row_centers,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(column_centers, row_centers, cells, item_indices))
 }
 
 /// Detect a table from cell-background rects that failed grid detection.
@@ -1691,12 +1681,7 @@ fn detect_row_stripe_table_from_cell_rects(
         non_empty_cells as f32 / total_cells * 100.0
     );
 
-    Some(Table {
-        columns: column_centers,
-        rows: row_centers,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(column_centers, row_centers, cells, item_indices))
 }
 
 /// Detect a table by merging all cluster rects into one group.
@@ -1875,12 +1860,7 @@ fn detect_merged_cluster_table(
         content_ratio * 100.0
     );
 
-    Some(Table {
-        columns: column_centers,
-        rows: row_centers,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(column_centers, row_centers, cells, item_indices))
 }
 
 /// Cluster text item X positions into column centers with a given minimum threshold.

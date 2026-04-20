@@ -1786,25 +1786,22 @@ fn compute_layout_complexity(
             // lists. They aren't tables in any user-facing sense, so don't
             // count them toward LayoutComplexity (would also trip the
             // table-page guard in column detection below).
-            let has_real_table = |tables: &[tables::Table]| {
-                tables
-                    .iter()
-                    .any(|t| !tables::is_table_of_contents(&t.cells))
-            };
+            let has_data_table =
+                |tables: &[tables::Table]| tables.iter().any(|t| t.kind == tables::TableKind::Data);
 
             let (rect_tables, _) = tables::detect_tables_from_rects(&band_items, &band_rects, page);
-            if has_real_table(&rect_tables) {
+            if has_data_table(&rect_tables) {
                 found_table = true;
                 break;
             }
             let line_tables = tables::detect_tables_from_lines(&band_items, &band_lines, page);
-            if has_real_table(&line_tables) {
+            if has_data_table(&line_tables) {
                 found_table = true;
                 break;
             }
             // Heuristic fallback for borderless tables
             let heuristic_tables = tables::detect_tables(&band_items, base_size, false);
-            if has_real_table(&heuristic_tables) {
+            if has_data_table(&heuristic_tables) {
                 found_table = true;
                 break;
             }

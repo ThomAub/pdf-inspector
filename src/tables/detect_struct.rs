@@ -188,12 +188,12 @@ pub fn detect_tables_from_struct_tree(
         all_item_indices.sort_unstable();
         all_item_indices.dedup();
 
-        tables.push(Table {
-            columns: col_positions,
-            rows: row_positions,
+        tables.push(Table::new(
+            col_positions,
+            row_positions,
             cells,
-            item_indices: all_item_indices,
-        });
+            all_item_indices,
+        ));
     }
 
     tables

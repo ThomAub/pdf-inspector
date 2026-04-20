@@ -687,12 +687,7 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         item_indices.len()
     );
 
-    Some(Table {
-        columns,
-        rows,
-        cells,
-        item_indices,
-    })
+    Some(Table::new(columns, rows, cells, item_indices))
 }
 
 /// Check if this looks like a key-value pair layout rather than a table

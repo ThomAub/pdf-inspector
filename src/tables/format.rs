@@ -1,26 +1,19 @@
 //! Table-to-markdown formatting and cell cleanup.
 
-use super::detect_heuristic::is_table_of_contents;
-use super::Table;
+use super::{Table, TableKind};
 
 pub fn table_to_markdown(table: &Table) -> String {
     if table.cells.is_empty() || table.cells[0].is_empty() {
         return String::new();
     }
 
-    // Detect TOC on the raw cells: clean_table_cells merges rows in ways
-    // that can make genuine data tables superficially resemble a TOC
-    // (short numeric cells, few columns) — but the raw detection here
-    // preserves the original multi-column structure and only matches the
-    // true TOC pattern.
-    //
-    // Tables of contents render poorly as markdown tables — emit a flat
-    // per-row text list instead so the page numbers stay aligned with
-    // their section titles rather than drifting to a separate column.
-    // Format from raw cells: continuation-row merging collapses separate
-    // TOC entries (e.g. "6.2 Contamination" + "6.2.1 SWE-bench") into a
-    // single line because sub-entries leave column 0 empty.
-    if is_table_of_contents(&table.cells) {
+    // TOCs render poorly as markdown tables — emit a flat per-row text list
+    // instead so the page numbers stay aligned with their section titles
+    // rather than drifting to a separate column. Format from raw cells
+    // because continuation-row merging in clean_table_cells collapses
+    // separate TOC entries (e.g. "6.2 Contamination" + "6.2.1 SWE-bench")
+    // into one line where sub-entries leave column 0 empty.
+    if table.kind == TableKind::Toc {
         return format_toc_as_list(&table.cells, &[]);
     }
 
@@ -470,6 +463,7 @@ mod tests {
                 vec!["Bob".into(), "25".into()],
             ],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Name|"));
@@ -485,6 +479,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec!["Only".into(), "Row".into()]],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Only|"));
@@ -498,6 +493,7 @@ mod tests {
             rows: vec![],
             cells: vec![],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
         assert_eq!(table_to_markdown(&table), "");
     }
@@ -513,6 +509,7 @@ mod tests {
                 vec!["(1)".into(), "Footnote text".into()],
             ],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("(1) Footnote text"));
@@ -528,6 +525,7 @@ mod tests {
                 vec!["太郎".into(), "25".into()],
             ],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("名前"));
@@ -541,6 +539,7 @@ mod tests {
             rows: vec![500.0],
             cells: vec![vec![]],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
         assert_eq!(table_to_markdown(&table), "");
     }
@@ -550,10 +549,10 @@ mod tests {
         // A TOC-shaped table with section numbers in col 0 and page numbers
         // in the last column should render as a flat list, not a markdown
         // table, so the page numbers stay on the same line as their titles.
-        let table = Table {
-            columns: vec![50.0, 80.0, 300.0],
-            rows: vec![500.0; 5],
-            cells: vec![
+        let table = Table::new(
+            vec![50.0, 80.0, 300.0],
+            vec![500.0; 5],
+            vec![
                 vec![
                     "4.3".into(),
                     "Case studies and targeted evaluations".into(),
@@ -572,8 +571,9 @@ mod tests {
                 vec!["4.4".into(), "Capability evaluations".into(), "101".into()],
                 vec!["4.5".into(), "White-box analyses".into(), "113".into()],
             ],
-            item_indices: vec![],
-        };
+            vec![],
+        );
+        assert_eq!(table.kind, TableKind::Toc);
         let md = table_to_markdown(&table);
         assert!(
             !md.contains("|---|"),
