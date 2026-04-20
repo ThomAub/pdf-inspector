@@ -581,8 +581,14 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
     // Validation 1: some rows should have content in first column.
     // Use a lower threshold (25%) for tables with wrapped cells where
     // continuation lines leave the first column empty.
+    // Skip when cells form a narrow TOC pattern: hierarchical entries indented
+    // across multiple X levels leave the leftmost column sparse (only top-level
+    // chapters land there) but the structure is still a valid TOC. Narrow only
+    // (<=5 cols) — wide multi-column TOCs (e.g. 2-up indices) would render
+    // poorly through format_toc_as_list, which assumes one entry per row.
     let rows_with_first_col = cells.iter().filter(|row| !row[0].is_empty()).count();
-    if rows_with_first_col < rows.len() / 4 {
+    let is_narrow_toc = columns.len() <= 5 && is_table_of_contents(&cells);
+    if rows_with_first_col < rows.len() / 4 && !is_narrow_toc {
         log::debug!(
             "  validation 1 fail: {}/{} rows have first col",
             rows_with_first_col,
@@ -653,8 +659,12 @@ fn detect_table_in_region(items: &[(usize, &TextItem)], mode: TableDetectionMode
         return None;
     }
 
-    // Validation 8: Reject paragraph-like content falsely detected as tables
-    if is_paragraph_content(&cells) {
+    // Validation 8: Reject paragraph-like content falsely detected as tables.
+    // TOC pages with deep indentation (top-level chapters in col 0, subsections
+    // in cols 1-3, page numbers in last col) leave most cells empty and trip
+    // the paragraph heuristic; TOC shape is a safer signal here. Narrow only
+    // — see narrow-TOC rationale at validation 1.
+    if is_paragraph_content(&cells) && !is_narrow_toc {
         log::debug!("  validation 9 fail: paragraph content");
         return None;
     }
@@ -1598,6 +1608,62 @@ mod tests {
         assert!(
             !is_table_of_contents(&cells),
             "data table with dot-leader labels should not be rejected as TOC"
+        );
+    }
+
+    #[test]
+    fn is_table_of_contents_accepts_hierarchical_indented_toc() {
+        // Mythos system card pages 4-5: top-level chapters indent at col 0,
+        // subsections at cols 1-2, leaving col 0 mostly empty (only ~10% of
+        // rows). Validation 1 was rejecting these even though the structure
+        // is unambiguously a TOC.
+        let cells = vec![
+            vec!["Abstract".to_string(), String::new(), "3".to_string()],
+            vec![
+                "1 Introduction".to_string(),
+                String::new(),
+                "10".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.1 Model training".to_string(),
+                "11".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.1.1 Training data".to_string(),
+                "11".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.1.2 Crowd workers".to_string(),
+                "12".to_string(),
+            ],
+            vec![
+                String::new(),
+                "1.2 Release decision".to_string(),
+                "13".to_string(),
+            ],
+            vec![
+                "2 RSP evaluations".to_string(),
+                String::new(),
+                "16".to_string(),
+            ],
+            vec![
+                String::new(),
+                "2.1 RSP risk assessment".to_string(),
+                "16".to_string(),
+            ],
+            vec![String::new(), "2.1.1 Context".to_string(), "16".to_string()],
+            vec![
+                String::new(),
+                "2.2 CB evaluations".to_string(),
+                "20".to_string(),
+            ],
+        ];
+        assert!(
+            is_table_of_contents(&cells),
+            "hierarchical TOC with sparse col 0 should still be detected"
         );
     }
 
