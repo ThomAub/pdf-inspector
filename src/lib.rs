@@ -1782,19 +1782,29 @@ fn compute_layout_complexity(
                 markdown::filter_lines_to_band(lines, page, x_lo, x_hi)
             };
 
+            // TOC pages route through the table detector but render as flat
+            // lists. They aren't tables in any user-facing sense, so don't
+            // count them toward LayoutComplexity (would also trip the
+            // table-page guard in column detection below).
+            let has_real_table = |tables: &[tables::Table]| {
+                tables
+                    .iter()
+                    .any(|t| !tables::is_table_of_contents(&t.cells))
+            };
+
             let (rect_tables, _) = tables::detect_tables_from_rects(&band_items, &band_rects, page);
-            if !rect_tables.is_empty() {
+            if has_real_table(&rect_tables) {
                 found_table = true;
                 break;
             }
             let line_tables = tables::detect_tables_from_lines(&band_items, &band_lines, page);
-            if !line_tables.is_empty() {
+            if has_real_table(&line_tables) {
                 found_table = true;
                 break;
             }
             // Heuristic fallback for borderless tables
             let heuristic_tables = tables::detect_tables(&band_items, base_size, false);
-            if !heuristic_tables.is_empty() {
+            if has_real_table(&heuristic_tables) {
                 found_table = true;
                 break;
             }

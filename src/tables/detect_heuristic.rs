@@ -916,7 +916,7 @@ fn looks_like_number(s: &str) -> bool {
 /// Check if this looks like a Table of Contents (either style).
 ///
 /// Used by format.rs to render TOCs as flat lists instead of markdown tables.
-pub(super) fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
+pub fn is_table_of_contents(cells: &[Vec<String>]) -> bool {
     is_dot_leader_toc(cells) || is_tabular_toc(cells)
 }
 

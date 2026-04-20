@@ -10,7 +10,7 @@ mod financial;
 mod format;
 mod grid;
 
-pub use detect_heuristic::detect_tables;
+pub use detect_heuristic::{detect_tables, is_table_of_contents};
 pub use detect_lines::detect_tables_from_lines;
 pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
