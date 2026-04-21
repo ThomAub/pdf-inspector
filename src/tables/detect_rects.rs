@@ -1156,11 +1156,18 @@ fn propagate_merged_cells(
                 continue;
             }
 
-            // Find first and last grid rows that the rect spans
-            let first_row = (0..num_rows)
-                .find(|&r| ry <= row_edges[r] + tol && (ry + rh) >= row_edges[r + 1] - tol);
-            let last_row = (0..num_rows)
-                .rfind(|&r| ry <= row_edges[r] + tol && (ry + rh) >= row_edges[r + 1] - tol);
+            // Find first and last grid rows that the rect spans.
+            //
+            // A merged-cell rect CONTAINS the rows it spans — its bottom sits
+            // at or below the row bottom and its top sits at or above the row
+            // top (within tol). A pure overlap check (any overlap within tol)
+            // gives false positives at shared row boundaries: a rect whose
+            // top equals row N's bottom would be considered to span row N
+            // even though it lies entirely below, cascading body text from
+            // unrelated rows into a single header cell.
+            let spans = |r: usize| ry <= row_edges[r + 1] + tol && (ry + rh) >= row_edges[r] - tol;
+            let first_row = (0..num_rows).find(|&r| spans(r));
+            let last_row = (0..num_rows).rfind(|&r| spans(r));
 
             let (first, last) = match (first_row, last_row) {
                 (Some(f), Some(l)) if l > f => (f, l),
@@ -2348,6 +2355,27 @@ mod tests {
         // Column 0 should be unchanged
         assert_eq!(cells[0][0], "A");
         assert_eq!(cells[1][0], "B");
+    }
+
+    #[test]
+    fn test_propagate_merged_cells_rect_tangent_to_row_boundary() {
+        // Regression: a rect whose top exactly equals a row's bottom lies
+        // entirely outside that row, so it must not be considered to span
+        // it. With the old overlap-based predicate this cascaded into body
+        // text from unrelated rows being merged into a single header cell
+        // (mythos system card CB task-based evaluations table).
+        //
+        // Layout: two rows 0..80 and 80..160 (bottom → top in PDF coords),
+        // rect occupies only the lower row (y=0..80). Its top equals the
+        // upper row's bottom; it must not span the upper row.
+        let col_edges = vec![0.0, 50.0];
+        let row_edges = vec![160.0, 80.0, 0.0]; // top → bot
+        let mut cells = vec![vec!["Upper".to_string()], vec!["Lower".to_string()]];
+        let group_rects = vec![(0.0, 0.0, 50.0, 80.0)]; // rect at y=0..80
+        let skip = vec![false];
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, &group_rects, &skip);
+        assert_eq!(cells[0][0], "Upper", "upper row must not be merged");
+        assert_eq!(cells[1][0], "Lower", "lower row must not be touched");
     }
 
     #[test]
