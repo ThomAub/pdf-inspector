@@ -1158,14 +1158,19 @@ fn propagate_merged_cells(
 
             // Find first and last grid rows that the rect spans.
             //
-            // A merged-cell rect CONTAINS the rows it spans — its bottom sits
-            // at or below the row bottom and its top sits at or above the row
-            // top (within tol). A pure overlap check (any overlap within tol)
-            // gives false positives at shared row boundaries: a rect whose
-            // top equals row N's bottom would be considered to span row N
-            // even though it lies entirely below, cascading body text from
-            // unrelated rows into a single header cell.
-            let spans = |r: usize| ry <= row_edges[r + 1] + tol && (ry + rh) >= row_edges[r] - tol;
+            // Require a rect to actually overlap the row by more than `tol`
+            // to count as a span. A "rect bottom ≤ row top + tol AND rect
+            // top ≥ row bottom − tol" check gives false positives at shared
+            // row boundaries — a rect whose top equals row N's bottom lies
+            // entirely below the row but still passes the tolerance-slack
+            // check, cascading body text from unrelated rows into one
+            // merged cell.
+            let spans = |r: usize| {
+                let row_top = row_edges[r];
+                let row_bot = row_edges[r + 1];
+                let overlap = (row_top.min(ry + rh) - row_bot.max(ry)).max(0.0);
+                overlap > tol
+            };
             let first_row = (0..num_rows).find(|&r| spans(r));
             let last_row = (0..num_rows).rfind(|&r| spans(r));
 
@@ -1672,6 +1677,49 @@ fn detect_row_stripe_table_from_cell_rects(
             num_rows, num_cols
         );
         return None;
+    }
+
+    // Reject "tables" that are actually prose in a framed region.
+    // Columns here come from text X-position clustering; when prose wraps
+    // inside a bounding-box rect (e.g. chat-transcript figures) the
+    // word-boundary gaps cluster into many spurious columns, and the
+    // resulting cells hold sentence fragments riddled with common English
+    // function words. Count cells with any such word and reject when
+    // 20%+ of non-empty cells match — real tabular data (labels, units,
+    // numbers) rarely contains these words.
+    if num_cols >= 4 {
+        const PROSE_WORDS: &[&str] = &[
+            "a", "an", "the", "of", "to", "is", "was", "are", "were", "be", "been", "in", "on",
+            "at", "with", "for", "by", "as", "and", "or", "but", "this", "that", "these", "those",
+            "from", "into", "has", "have", "had", "not", "don't", "doesn't", "it's", "its", "it",
+            "i", "me", "my", "we", "our", "us", "you", "your", "they", "them", "their", "he",
+            "she", "his", "her",
+        ];
+        let mut prose_cells = 0usize;
+        let mut counted = 0usize;
+        for row in &cells {
+            for cell in row {
+                let t = cell.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                counted += 1;
+                let lower = t.to_ascii_lowercase();
+                let has_prose_word = lower
+                    .split(|c: char| !c.is_ascii_alphabetic() && c != '\'')
+                    .any(|w| PROSE_WORDS.contains(&w));
+                if has_prose_word {
+                    prose_cells += 1;
+                }
+            }
+        }
+        if counted > 0 && prose_cells * 5 >= counted {
+            debug!(
+                "  cell-rect rejected: {}/{} cells contain prose function words — likely prose",
+                prose_cells, counted
+            );
+            return None;
+        }
     }
 
     let column_centers: Vec<f32> = (0..num_cols)
