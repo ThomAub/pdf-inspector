@@ -839,7 +839,7 @@ pub fn extract_tables_with_structure_cells_mem(
     inputs: &[TsrTableInput],
 ) -> Result<Vec<Vec<tables::StructuredCell>>, PdfError> {
     use tables::structured::{
-        cell_px_to_page_pt, parse_structure, polygon_to_aabb, StructuredCell,
+        cell_px_to_page_pt, normalize_cell_bands, parse_structure, polygon_to_aabb, StructuredCell,
     };
 
     validate_pdf_bytes(buffer)?;
@@ -906,32 +906,15 @@ pub fn extract_tables_with_structure_cells_mem(
 
         let mut cells: Vec<StructuredCell> = Vec::with_capacity(slots.len());
         for slot in &slots {
-            let cell_text;
             let page_pt_bbox;
 
             if let Some(coords_arr) = input.cell_bboxes.get(slot.bbox_idx) {
                 if let Some(aabb_px) = polygon_to_aabb(coords_arr) {
-                    let aabb_pt = cell_px_to_page_pt(aabb_px, input.render_dpi, crop_origin);
-                    let raw = collect_text_in_region_with_options(
-                        items,
-                        aabb_pt[0],
-                        aabb_pt[1],
-                        aabb_pt[2],
-                        aabb_pt[3],
-                        page_h,
-                        coords,
-                        adaptive_threshold,
-                    );
-                    // Markdown cells must be one line — collapse line breaks
-                    // produced by the line-grouping pass.
-                    cell_text = raw.replace(['\n', '\r'], " ");
-                    page_pt_bbox = aabb_pt;
+                    page_pt_bbox = cell_px_to_page_pt(aabb_px, input.render_dpi, crop_origin);
                 } else {
-                    cell_text = String::new();
                     page_pt_bbox = [0.0, 0.0, 0.0, 0.0];
                 }
             } else {
-                cell_text = String::new();
                 page_pt_bbox = [0.0, 0.0, 0.0, 0.0];
             }
 
@@ -941,9 +924,19 @@ pub fn extract_tables_with_structure_cells_mem(
                 rowspan: slot.rowspan,
                 colspan: slot.colspan,
                 is_header: slot.is_header,
-                text: cell_text,
+                text: String::new(),
                 page_pt_bbox,
             });
+        }
+
+        normalize_cell_bands(&mut cells);
+        for cell in &mut cells {
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            let raw =
+                collect_text_in_tsr_cell(items, x1, y1, x2, y2, page_h, coords, adaptive_threshold);
+            // Markdown cells must be one line — collapse line breaks produced
+            // by the line-grouping pass.
+            cell.text = raw.replace(['\n', '\r'], " ");
         }
 
         results.push(cells);
@@ -1062,6 +1055,30 @@ fn collect_text_in_region_with_options(
         .filter(|item| region_overlaps_item(item, bounds))
         .cloned()
         .collect();
+    collect_text_from_matched_items(matched, adaptive_threshold)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_text_in_tsr_cell(
+    items: &[TextItem],
+    rx1: f32,
+    ry1: f32,
+    rx2: f32,
+    ry2: f32,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+    adaptive_threshold: f32,
+) -> String {
+    let bounds = region_bounds(rx1, ry1, rx2, ry2, page_height, coord_space);
+    let matched: Vec<TextItem> = items
+        .iter()
+        .filter(|item| tsr_region_contains_item(item, bounds))
+        .cloned()
+        .collect();
+    collect_text_from_matched_items(matched, adaptive_threshold)
+}
+
+fn collect_text_from_matched_items(matched: Vec<TextItem>, adaptive_threshold: f32) -> String {
     if matched.is_empty() {
         return String::new();
     }
@@ -1161,6 +1178,30 @@ fn region_overlaps_item(item: &TextItem, bounds: RegionBounds) -> bool {
         - item_y_min.max(bounds.y_min - REGION_MARGIN))
     .max(0.0);
     x_overlap > 0.0 && y_overlap > 0.0
+}
+
+fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
+    let item_x_min = item.x;
+    let item_x_max = item.x + text_utils::effective_width(item);
+    let item_y_min = item.y;
+    let item_y_max = item.y + item.height;
+
+    let center_x = (item_x_min + item_x_max) * 0.5;
+    let center_y = (item_y_min + item_y_max) * 0.5;
+    if center_x >= bounds.x_min
+        && center_x <= bounds.x_max
+        && center_y >= bounds.y_min
+        && center_y <= bounds.y_max
+    {
+        return true;
+    }
+
+    let x_overlap = (item_x_max.min(bounds.x_max) - item_x_min.max(bounds.x_min)).max(0.0);
+    let y_overlap = (item_y_max.min(bounds.y_max) - item_y_min.max(bounds.y_min)).max(0.0);
+    let item_width = (item_x_max - item_x_min).max(0.1);
+    let item_height = (item_y_max - item_y_min).max(0.1);
+
+    x_overlap / item_width >= 0.6 && y_overlap / item_height >= 0.6
 }
 
 // =========================================================================
@@ -2217,6 +2258,24 @@ pub(crate) fn validate_pdf_file<P: AsRef<Path>>(path: P) -> Result<(), PdfError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ItemType;
+
+    fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            font: "Helvetica".to_string(),
+            font_size: height,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
 
     #[test]
     fn test_detect_encoding_issues_fffd() {
@@ -2296,5 +2355,98 @@ mod tests {
             !is_cid_garbage(japanese),
             "Valid Japanese text should not be flagged as garbage"
         );
+    }
+
+    #[test]
+    fn tsr_text_fill_does_not_pull_neighboring_overlapping_rows() {
+        use crate::tables::structured::normalize_cell_bands;
+        use crate::tables::StructuredCell;
+
+        let items = vec![
+            test_item("Branch Name", 12.0, 88.0, 55.0, 8.0),
+            test_item("Deposits", 112.0, 88.0, 36.0, 8.0),
+            test_item("Oak Street", 12.0, 72.0, 48.0, 8.0),
+            test_item("100", 112.0, 72.0, 18.0, 8.0),
+            test_item("Boardwalk", 12.0, 55.2, 46.0, 8.0),
+            test_item("200", 112.0, 55.2, 18.0, 8.0),
+        ];
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [10.0, 100.0, 100.0, 125.0],
+            },
+            StructuredCell {
+                row: 0,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [100.0, 100.0, 170.0, 125.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 116.0, 100.0, 141.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [100.0, 116.0, 170.0, 141.0],
+            },
+            StructuredCell {
+                row: 2,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 132.8, 100.0, 157.8],
+            },
+            StructuredCell {
+                row: 2,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [100.0, 132.8, 170.0, 157.8],
+            },
+        ];
+
+        normalize_cell_bands(&mut cells);
+        for cell in &mut cells {
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            cell.text = collect_text_in_tsr_cell(
+                &items,
+                x1,
+                y1,
+                x2,
+                y2,
+                200.0,
+                RegionCoordSpace::Standard,
+                0.10,
+            );
+        }
+
+        assert_eq!(cells[0].text, "Branch Name");
+        assert_eq!(cells[2].text, "Oak Street");
+        assert_eq!(cells[4].text, "Boardwalk");
+        assert!(!cells[0].text.contains("Oak Street"));
+        assert!(!cells[2].text.contains("Branch Name"));
+        assert!(!cells[2].text.contains("Boardwalk"));
     }
 }

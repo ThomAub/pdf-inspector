@@ -12,7 +12,7 @@
 //! Cell text is supplied separately by the caller (typically by overlap-
 //! testing PDF text items against each cell's page-PDF-pt bbox).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A single resolved cell, with both structural metadata and its bbox in
 /// page PDF-points (top-left origin).
@@ -217,6 +217,144 @@ pub(crate) fn cell_px_to_page_pt(
         cell_px[2] * pt_per_px + x_off,
         cell_px[3] * pt_per_px + y_off,
     ]
+}
+
+/// Refine TSR cell bboxes into non-overlapping row/column bands.
+///
+/// SLANet-style bboxes are often plausible but too tall on dense borderless
+/// tables. Native PDF text assignment is more reliable when each parsed row
+/// owns the band between neighboring row centers instead of the full model box.
+pub(crate) fn normalize_cell_bands(cells: &mut [StructuredCell]) {
+    if cells.len() < 2 {
+        return;
+    }
+
+    let row_bands = derive_axis_bands(cells, Axis::Y);
+    let col_bands = derive_axis_bands(cells, Axis::X);
+
+    for cell in cells {
+        let row_end = cell.row + cell.rowspan.max(1).saturating_sub(1);
+        if let (Some(&(y1, _)), Some(&(_, y2))) =
+            (row_bands.get(&cell.row), row_bands.get(&row_end))
+        {
+            let clamped_y1 = cell.page_pt_bbox[1].max(y1);
+            let clamped_y2 = cell.page_pt_bbox[3].min(y2);
+            if clamped_y1 < clamped_y2 {
+                cell.page_pt_bbox[1] = clamped_y1;
+                cell.page_pt_bbox[3] = clamped_y2;
+            }
+        }
+
+        let col_end = cell.col + cell.colspan.max(1).saturating_sub(1);
+        if let (Some(&(x1, _)), Some(&(_, x2))) =
+            (col_bands.get(&cell.col), col_bands.get(&col_end))
+        {
+            let clamped_x1 = cell.page_pt_bbox[0].max(x1);
+            let clamped_x2 = cell.page_pt_bbox[2].min(x2);
+            if clamped_x1 < clamped_x2 {
+                cell.page_pt_bbox[0] = clamped_x1;
+                cell.page_pt_bbox[2] = clamped_x2;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Axis {
+    X,
+    Y,
+}
+
+fn derive_axis_bands(cells: &[StructuredCell], axis: Axis) -> HashMap<usize, (f32, f32)> {
+    let mut by_index: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
+
+    // Prefer non-spanning cells so colspan/rowspan boxes do not skew a single
+    // column/row center. If an axis has no non-spanning examples for an index,
+    // fall back to anchored cells below.
+    for cell in cells {
+        let span = match axis {
+            Axis::X => cell.colspan.max(1),
+            Axis::Y => cell.rowspan.max(1),
+        };
+        if span == 1 {
+            let idx = match axis {
+                Axis::X => cell.col,
+                Axis::Y => cell.row,
+            };
+            by_index
+                .entry(idx)
+                .or_default()
+                .push(axis_bounds(cell.page_pt_bbox, axis));
+        }
+    }
+
+    for cell in cells {
+        let idx = match axis {
+            Axis::X => cell.col,
+            Axis::Y => cell.row,
+        };
+        if !by_index.contains_key(&idx) {
+            by_index
+                .entry(idx)
+                .or_default()
+                .push(axis_bounds(cell.page_pt_bbox, axis));
+        }
+    }
+
+    let mut rows: Vec<(usize, f32, f32, f32)> = by_index
+        .into_iter()
+        .filter_map(|(idx, bounds)| {
+            let mut min_edge = f32::INFINITY;
+            let mut max_edge = f32::NEG_INFINITY;
+            let mut center_sum = 0.0;
+            let mut count = 0usize;
+            for (lo, hi) in bounds {
+                if lo.is_finite() && hi.is_finite() && lo < hi {
+                    min_edge = min_edge.min(lo);
+                    max_edge = max_edge.max(hi);
+                    center_sum += (lo + hi) * 0.5;
+                    count += 1;
+                }
+            }
+            (count > 0).then_some((idx, center_sum / count as f32, min_edge, max_edge))
+        })
+        .collect();
+
+    if rows.len() < 2 {
+        return rows
+            .into_iter()
+            .map(|(idx, _center, lo, hi)| (idx, (lo, hi)))
+            .collect();
+    }
+
+    rows.sort_by_key(|(idx, _, _, _)| *idx);
+
+    let mut bands = HashMap::new();
+    for i in 0..rows.len() {
+        let (idx, _center, min_edge, max_edge) = rows[i];
+        let lo = if i == 0 {
+            min_edge
+        } else {
+            (rows[i - 1].1 + rows[i].1) * 0.5
+        };
+        let hi = if i + 1 == rows.len() {
+            max_edge
+        } else {
+            (rows[i].1 + rows[i + 1].1) * 0.5
+        };
+        if lo.is_finite() && hi.is_finite() && lo < hi {
+            bands.insert(idx, (lo, hi));
+        }
+    }
+
+    bands
+}
+
+fn axis_bounds(bbox: [f32; 4], axis: Axis) -> (f32, f32) {
+    match axis {
+        Axis::X => (bbox[0].min(bbox[2]), bbox[0].max(bbox[2])),
+        Axis::Y => (bbox[1].min(bbox[3]), bbox[1].max(bbox[3])),
+    }
 }
 
 /// Sanitize cell text for inclusion in a markdown pipe-table cell:
@@ -446,6 +584,102 @@ mod tests {
             assert!(aabb[0] >= 0.0 && aabb[2] <= 500.0, "bbox {i}: within crop");
             assert!(aabb[1] >= 0.0 && aabb[3] <= 200.0, "bbox {i}: within crop");
         }
+    }
+
+    #[test]
+    fn normalize_cell_bands_splits_overlapping_slanet_rows() {
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [10.0, 100.0, 90.0, 120.0],
+            },
+            StructuredCell {
+                row: 0,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [90.0, 100.0, 170.0, 120.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 116.0, 90.0, 136.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [90.0, 116.0, 170.0, 136.0],
+            },
+        ];
+
+        normalize_cell_bands(&mut cells);
+
+        assert_eq!(cells[0].page_pt_bbox[3], cells[2].page_pt_bbox[1]);
+        assert_eq!(cells[1].page_pt_bbox[3], cells[3].page_pt_bbox[1]);
+        assert!(
+            (cells[0].page_pt_bbox[3] - 118.0).abs() < 0.01,
+            "row separator should be midpoint between row centers: {:?}",
+            cells
+        );
+    }
+
+    #[test]
+    fn normalize_cell_bands_preserves_colspan_extent() {
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 2,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [8.0, 80.0, 172.0, 98.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 96.0, 90.0, 114.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [88.0, 96.0, 170.0, 114.0],
+            },
+        ];
+
+        normalize_cell_bands(&mut cells);
+
+        assert!(
+            cells[0].page_pt_bbox[0] <= cells[1].page_pt_bbox[0],
+            "spanning cell should retain the first column's left edge"
+        );
+        assert!(
+            cells[0].page_pt_bbox[2] >= cells[2].page_pt_bbox[2],
+            "spanning cell should retain the last column's right edge"
+        );
     }
 
     #[test]

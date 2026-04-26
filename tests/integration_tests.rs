@@ -1484,6 +1484,82 @@ fn poly(x1: f32, y1: f32, x2: f32, y2: f32) -> Vec<f32> {
     vec![x1, y1, x2, y1, x2, y2, x1, y2]
 }
 
+fn synthetic_dense_table_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    let operations = vec![
+        Operation::new("BT", vec![]),
+        Operation::new("Tf", vec!["F1".into(), 10.into()]),
+        Operation::new("Td", vec![20.into(), 700.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Branch Name")]),
+        Operation::new("Td", vec![100.into(), 0.into()]),
+        Operation::new("Tj", vec![Object::string_literal("Deposits")]),
+        Operation::new("Td", vec![Object::Integer(-100), Object::Real(-16.8)]),
+        Operation::new("Tj", vec![Object::string_literal("Oak Street")]),
+        Operation::new("Td", vec![100.into(), 0.into()]),
+        Operation::new("Tj", vec![Object::string_literal("100")]),
+        Operation::new("Td", vec![Object::Integer(-100), Object::Real(-16.8)]),
+        Operation::new("Tj", vec![Object::string_literal("Boardwalk")]),
+        Operation::new("Td", vec![100.into(), 0.into()]),
+        Operation::new("Tj", vec![Object::string_literal("200")]),
+        Operation::new("ET", vec![]),
+    ];
+    let content = Content { operations }.encode().unwrap();
+    doc.objects
+        .insert(content_id, Stream::new(dictionary! {}, content).into());
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 200.into(), 800.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! {
+                    "F1" => font_id,
+                },
+            },
+            "Contents" => content_id,
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
 #[test]
 fn test_extract_tables_with_structure_real_pdf_bits_pilani() {
     use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
@@ -1562,6 +1638,64 @@ fn test_extract_tables_with_structure_real_pdf_bits_pilani() {
         md, expected,
         "structured-table markdown should match the gold standard exactly\nactual: {md}"
     );
+}
+
+#[test]
+fn test_extract_tables_with_structure_dense_overlapping_slanet_boxes() {
+    use pdf_inspector::{extract_tables_with_structure_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    // Rows are spaced 16.8pt apart, while the SLANet-style boxes are 40pt
+    // tall and overlap adjacent rows. Text must still land in only one row.
+    let cell_bboxes = vec![
+        poly(10.0, 72.0, 100.0, 112.0),
+        poly(90.0, 72.0, 180.0, 112.0),
+        poly(10.0, 88.8, 100.0, 128.8),
+        poly(90.0, 88.8, 180.0, 128.8),
+        poly(10.0, 105.6, 100.0, 145.6),
+        poly(90.0, 105.6, 180.0, 145.6),
+    ];
+
+    let mds = extract_tables_with_structure_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+
+    let expected = "|Branch Name|Deposits|\n|---|---|\n|Oak Street|100|\n|Boardwalk|200|\n";
+    assert_eq!(mds[0], expected);
+    assert!(!mds[0].contains("Branch Name Oak Street"));
+    assert!(!mds[0].contains("Oak Street Boardwalk"));
 }
 
 #[test]
