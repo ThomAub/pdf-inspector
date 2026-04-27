@@ -422,6 +422,52 @@ pub fn extract_tables_with_structure_cells(
     })
 }
 
+/// One result from `extractTablesWithStructureAuto` — markdown plus a
+/// diagnostic flag identifying which path produced it.
+///
+/// `fallbackReason` is `null` when the TSR-hybrid path produced the
+/// markdown directly. When stage 1's quality check fires (the cells
+/// look like a SLANet detection pathology — phantom rows or multi-row
+/// content in a single cell), the heuristic table extractor is run on
+/// the same region instead, and `fallbackReason` carries the diagnostic
+/// label (`"phantom_empty_row"`, `"multi_row_in_cell"`).
+#[napi(object)]
+pub struct TableExtractionResultJs {
+    pub markdown: String,
+    pub fallback_reason: Option<String>,
+}
+
+/// Auto-fallback variant of [`extractTablesWithStructure`].
+///
+/// Runs the TSR-hybrid path, checks the resulting cells for known
+/// SLANet detection pathologies, and falls back to the heuristic
+/// `extractTablesInRegions` for any input where the TSR path looks
+/// compromised.
+///
+/// On clean inputs this returns identical markdown to
+/// `extractTablesWithStructure`; on flagged inputs the heuristic
+/// markdown replaces the TSR markdown and `fallbackReason` is set.
+#[napi]
+pub fn extract_tables_with_structure_auto(
+    buffer: Buffer,
+    inputs: Vec<TsrTableInputJs>,
+) -> Result<Vec<TableExtractionResultJs>> {
+    let bytes: Vec<u8> = buffer.to_vec();
+    let parsed = parse_tsr_inputs(&inputs);
+
+    catch_panic("extract_tables_with_structure_auto", move || {
+        let result = pdf_inspector::extract_tables_with_structure_auto_mem(&bytes, &parsed)
+            .map_err(|e| to_napi_err(e, "extract_tables_with_structure_auto"))?;
+        Ok(result
+            .into_iter()
+            .map(|r| TableExtractionResultJs {
+                markdown: r.markdown,
+                fallback_reason: r.fallback_reason,
+            })
+            .collect())
+    })
+}
+
 fn parse_tsr_inputs(inputs: &[TsrTableInputJs]) -> Vec<pdf_inspector::TsrTableInput> {
     inputs
         .iter()

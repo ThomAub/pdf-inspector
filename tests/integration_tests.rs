@@ -2053,6 +2053,144 @@ fn test_extract_tables_with_structure_separator_after_thead() {
 }
 
 // =========================================================================
+// extract_tables_with_structure_auto_mem tests (TSR + heuristic fallback)
+// =========================================================================
+
+#[test]
+fn test_auto_passes_through_clean_tsr_output() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // Cells fit each visible row cleanly. Same shape as the existing
+    // dense-overlap regression test — TSR should produce clean output
+    // and the auto wrapper should pass through with no fallback.
+    let cell_bboxes = vec![
+        poly(10.0, 72.0, 100.0, 112.0),
+        poly(90.0, 72.0, 180.0, 112.0),
+        poly(10.0, 88.8, 100.0, 128.8),
+        poly(90.0, 88.8, 180.0, 128.8),
+        poly(10.0, 105.6, 100.0, 145.6),
+        poly(90.0, 105.6, 180.0, 145.6),
+    ];
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].fallback_reason.is_none(),
+        "expected no fallback, got {:?}",
+        results[0].fallback_reason
+    );
+    assert!(results[0].markdown.contains("Oak Street"));
+    assert!(results[0].markdown.contains("Boardwalk"));
+    assert!(!results[0].markdown.contains("Oak Street Boardwalk"));
+}
+
+#[test]
+fn test_auto_falls_back_on_multi_row_in_cell() {
+    use pdf_inspector::{extract_tables_with_structure_auto_mem, TsrTableInput};
+
+    let buf = synthetic_dense_table_pdf();
+    // TSR returns only 2 rows for what's actually 3 visible PDF rows.
+    // Row 1's cells are tall enough to encompass both Oak Street and
+    // Boardwalk text — the FNBO row-undercount pattern.
+    let tokens: Vec<String> = [
+        "<table>",
+        "<thead>",
+        "<tr>",
+        "<th></th>",
+        "<th></th>",
+        "</tr>",
+        "</thead>",
+        "<tbody>",
+        "<tr>",
+        "<td></td>",
+        "<td></td>",
+        "</tr>",
+        "</tbody>",
+        "</table>",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    // Header row at top-left y=[88, 105] (covers "Branch Name"/"Deposits"
+    // at native y=700, top-left y≈92-103). The "data" row at top-left
+    // y=[105, 145] is intentionally tall — covers BOTH the Oak Street
+    // line (top-left y≈108-119) AND the Boardwalk line (y≈124-135).
+    let cell_bboxes = vec![
+        poly(10.0, 88.0, 100.0, 105.0),
+        poly(90.0, 88.0, 180.0, 105.0),
+        poly(10.0, 105.0, 100.0, 145.0),
+        poly(90.0, 105.0, 180.0, 145.0),
+    ];
+
+    let results = extract_tables_with_structure_auto_mem(
+        &buf,
+        &[TsrTableInput {
+            page: 0,
+            crop_pdf_pt_bbox: [0.0, 0.0, 200.0, 800.0],
+            render_dpi: 72.0,
+            structure_tokens: tokens,
+            cell_bboxes,
+        }],
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].fallback_reason.as_deref(),
+        Some("multi_row_in_cell"),
+        "expected multi_row_in_cell fallback, got {:?}",
+        results[0].fallback_reason
+    );
+    // The heuristic-fallback markdown should preserve all three PDF rows.
+    let md = &results[0].markdown;
+    assert!(md.contains("Oak Street"), "missing Oak Street: {md}");
+    assert!(md.contains("Boardwalk"), "missing Boardwalk: {md}");
+    assert!(md.contains("100"), "missing 100: {md}");
+    assert!(md.contains("200"), "missing 200: {md}");
+}
+
+#[test]
+fn test_auto_returns_empty_inputs() {
+    use pdf_inspector::extract_tables_with_structure_auto_mem;
+    let buf = synthetic_dense_table_pdf();
+    let results = extract_tables_with_structure_auto_mem(&buf, &[]).unwrap();
+    assert!(results.is_empty());
+}
+
+// =========================================================================
 // extract_pages_markdown_mem tests
 // =========================================================================
 
