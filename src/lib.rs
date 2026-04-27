@@ -930,19 +930,166 @@ pub fn extract_tables_with_structure_cells_mem(
         }
 
         normalize_cell_bands(&mut cells);
+
+        // Stage 1: strict text fill — each cell gets the items whose centers
+        // fall inside its (normalized) bbox or whose >=60% overlap rule fires.
+        // Track which item indices any cell claimed so the orphan pass below
+        // doesn't double-assign.
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for cell in &mut cells {
             let [x1, y1, x2, y2] = cell.page_pt_bbox;
-            let raw =
-                collect_text_in_tsr_cell(items, x1, y1, x2, y2, page_h, coords, adaptive_threshold);
+            let bounds = region_bounds(x1, y1, x2, y2, page_h, coords);
+            let mut matched: Vec<TextItem> = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                if tsr_region_contains_item(item, bounds) {
+                    claimed.insert(i);
+                    matched.push(item.clone());
+                }
+            }
             // Markdown cells must be one line — collapse line breaks produced
             // by the line-grouping pass.
-            cell.text = raw.replace(['\n', '\r'], " ");
+            cell.text = collect_text_from_matched_items(matched, adaptive_threshold)
+                .replace(['\n', '\r'], " ");
         }
+
+        // Stage 2: orphan assignment — text items that didn't land in any
+        // cell during stage 1 get assigned to their nearest *empty* cell,
+        // clamped by a plausibility cap derived from cell geometry.
+        //
+        // This recovers two failure modes left by `normalize_cell_bands`:
+        //   (a) header text positioned to the LEFT of a column whose band
+        //       was derived from data cells centered farther right, so the
+        //       header text falls outside the clamped band; and
+        //   (b) local SLANet row drift where a cell's bbox sits slightly
+        //       above/below its target text item, so the strict rules miss.
+        // Empty-cell-only is the safety net: a cell already filled by stage 1
+        // is never overwritten or augmented, so the cell-bleed case PR #62
+        // closed cannot regress.
+        tsr_assign_orphan_items(items, &mut cells, &claimed, page_h, coords);
 
         results.push(cells);
     }
 
     Ok(results)
+}
+
+/// Compute plausibility caps for the orphan-assignment pass. Returns
+/// `(cap_x, cap_y)` — the maximum x/y distance from a text item's center
+/// to a candidate empty cell's bbox before the candidate is rejected.
+///
+/// Caps are derived from cell geometry so they scale with the table:
+/// dense small-row tables get a tight cap, looser tables get more slack.
+/// Floor values guard against degenerate single-cell tables collapsing
+/// the cap to zero.
+fn tsr_assignment_caps(cells: &[tables::StructuredCell]) -> (f32, f32) {
+    let mut widths: Vec<f32> = Vec::with_capacity(cells.len());
+    let mut heights: Vec<f32> = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let [x1, y1, x2, y2] = cell.page_pt_bbox;
+        let w = (x2 - x1).abs();
+        let h = (y2 - y1).abs();
+        if w > 0.0 && h > 0.0 {
+            widths.push(w);
+            heights.push(h);
+        }
+    }
+    if widths.is_empty() {
+        return (0.0, 0.0);
+    }
+    widths.sort_by(|a, b| a.total_cmp(b));
+    heights.sort_by(|a, b| a.total_cmp(b));
+    let median_w = widths[widths.len() / 2];
+    let median_h = heights[heights.len() / 2];
+    // Floor values: even on a dense table, a 5pt floor handles small
+    // pixel-level bbox jitter without being so loose that we'd cross
+    // into a neighboring row/column. Symmetric in both axes.
+    let cap_x = median_w.max(5.0);
+    let cap_y = median_h.max(5.0);
+    (cap_x, cap_y)
+}
+
+/// For each text item that wasn't claimed by any cell during stage 1,
+/// find the nearest *empty* cell within `(cap_x, cap_y)` of the item's
+/// center and append the item's text to that cell. Cells that already
+/// have content are skipped — stage 2 only fills, never augments.
+///
+/// Distance is point-to-rect: 0 if the item center is inside the cell's
+/// bbox, else the axis-aligned gap to the nearest edge. Both x-gap and
+/// y-gap must be within their respective caps for a candidate to qualify;
+/// among qualifying candidates, the smallest combined euclidean distance
+/// wins.
+fn tsr_assign_orphan_items(
+    items: &[TextItem],
+    cells: &mut [tables::StructuredCell],
+    claimed: &std::collections::HashSet<usize>,
+    page_height: f32,
+    coord_space: RegionCoordSpace,
+) {
+    if cells.is_empty() {
+        return;
+    }
+    let (cap_x, cap_y) = tsr_assignment_caps(cells);
+    if cap_x <= 0.0 || cap_y <= 0.0 {
+        return;
+    }
+
+    // Pre-compute each empty cell's region bounds so we don't re-flip
+    // page coordinates per orphan-candidate pair.
+    let cell_bounds: Vec<Option<RegionBounds>> = cells
+        .iter()
+        .map(|cell| {
+            if !cell.text.is_empty() {
+                return None;
+            }
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            if x1 >= x2 || y1 >= y2 {
+                return None;
+            }
+            Some(region_bounds(x1, y1, x2, y2, page_height, coord_space))
+        })
+        .collect();
+
+    for (i, item) in items.iter().enumerate() {
+        if claimed.contains(&i) {
+            continue;
+        }
+        let item_w = text_utils::effective_width(item);
+        if item.text.trim().is_empty() {
+            continue;
+        }
+        let cx = item.x + item_w * 0.5;
+        let cy = item.y + item.height * 0.5;
+
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, bounds_opt) in cell_bounds.iter().enumerate() {
+            let Some(bounds) = bounds_opt else {
+                continue;
+            };
+            let dx = (bounds.x_min - cx).max(0.0).max(cx - bounds.x_max);
+            let dy = (bounds.y_min - cy).max(0.0).max(cy - bounds.y_max);
+            if dx > cap_x || dy > cap_y {
+                continue;
+            }
+            let dist_sq = dx * dx + dy * dy;
+            if best.is_none_or(|(_, d)| dist_sq < d) {
+                best = Some((ci, dist_sq));
+            }
+        }
+
+        if let Some((ci, _)) = best {
+            // Append, preserving stage 1's content if (rarely) another
+            // orphan in this same pass already filled the cell. Each
+            // orphan contributes its raw text — single-token items don't
+            // need the line-grouping pass that stage 1 uses.
+            let trimmed = item.text.trim();
+            if cells[ci].text.is_empty() {
+                cells[ci].text = trimmed.to_string();
+            } else {
+                cells[ci].text.push(' ');
+                cells[ci].text.push_str(trimmed);
+            }
+        }
+    }
 }
 
 /// Extract markdown tables using externally-supplied structure recovery.
@@ -1058,6 +1205,7 @@ fn collect_text_in_region_with_options(
     collect_text_from_matched_items(matched, adaptive_threshold)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn collect_text_in_tsr_cell(
     items: &[TextItem],
@@ -2448,5 +2596,294 @@ mod tests {
         assert!(!cells[0].text.contains("Oak Street"));
         assert!(!cells[2].text.contains("Branch Name"));
         assert!(!cells[2].text.contains("Boardwalk"));
+    }
+
+    #[test]
+    fn tsr_assignment_caps_uses_median_geometry() {
+        use crate::tables::StructuredCell;
+        let cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [0.0, 0.0, 100.0, 20.0], // 100x20
+            },
+            StructuredCell {
+                row: 0,
+                col: 1,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [100.0, 0.0, 200.0, 20.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [0.0, 20.0, 100.0, 40.0],
+            },
+        ];
+        let (cap_x, cap_y) = tsr_assignment_caps(&cells);
+        assert_eq!(cap_x, 100.0);
+        assert_eq!(cap_y, 20.0);
+    }
+
+    #[test]
+    fn tsr_assignment_caps_floor_protects_degenerate_input() {
+        use crate::tables::StructuredCell;
+        let cells = vec![StructuredCell {
+            row: 0,
+            col: 0,
+            rowspan: 1,
+            colspan: 1,
+            is_header: false,
+            text: String::new(),
+            page_pt_bbox: [0.0, 0.0, 1.0, 1.0],
+        }];
+        let (cap_x, cap_y) = tsr_assignment_caps(&cells);
+        assert_eq!(cap_x, 5.0);
+        assert_eq!(cap_y, 5.0);
+    }
+
+    #[test]
+    fn stage2_recovers_left_aligned_header_text_outside_data_band() {
+        // Symptom A reproduction: the column band derived from data-cell
+        // centers ends up too far right, so header text positioned at the
+        // left of the column falls outside the band and stage 1's strict
+        // membership rejects it. Stage 2 should re-attach by proximity.
+        //
+        // Item coords are bottom-left native; cell page_pt_bbox is top-left.
+        // page_height=200 so a top-left bbox y=[88, 100] flips to native y
+        // bounds [100, 112]; an item at native y=104 (center 108) lands in.
+        use crate::tables::StructuredCell;
+        let items = vec![
+            // Header text — centered in row 0 (native y=104, center 108) but
+            // at the LEFT of the column (x=175, far left of the [410, 700]
+            // data-derived band).
+            test_item("Address", 175.0, 104.0, 50.0, 8.0),
+            // Data row 1 — fits its cell.
+            test_item("205 W Oak St", 420.0, 84.0, 100.0, 8.0),
+            // Data row 2 — fits its cell.
+            test_item("155 E Boardwalk Dr", 420.0, 64.0, 100.0, 8.0),
+        ];
+        // Cells AFTER normalize_cell_bands would have run — col 0 band
+        // shifted right by data-cell centers, header cell now excludes
+        // the "Address" text at center x=200.
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: true,
+                text: String::new(),
+                page_pt_bbox: [410.0, 88.0, 700.0, 100.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [410.0, 108.0, 700.0, 116.0],
+            },
+            StructuredCell {
+                row: 2,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [410.0, 128.0, 700.0, 136.0],
+            },
+        ];
+        let page_h = 200.0;
+
+        // Stage 1 mimic — fill cells via the strict rule, track claimed.
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for cell in &mut cells {
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            let bounds = region_bounds(x1, y1, x2, y2, page_h, RegionCoordSpace::Standard);
+            let mut matched: Vec<TextItem> = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                if tsr_region_contains_item(item, bounds) {
+                    claimed.insert(i);
+                    matched.push(item.clone());
+                }
+            }
+            cell.text = collect_text_from_matched_items(matched, 0.10).replace(['\n', '\r'], " ");
+        }
+        // Header is empty after stage 1 (Address fell outside col 0 band).
+        assert_eq!(cells[0].text, "", "header should be empty after stage 1");
+        // Data rows already populated.
+        assert!(
+            cells[1].text.contains("Oak"),
+            "data row 1 should contain Oak: got {:?}",
+            cells[1].text
+        );
+        assert!(
+            cells[2].text.contains("Boardwalk"),
+            "data row 2 should contain Boardwalk: got {:?}",
+            cells[2].text
+        );
+
+        // Stage 2 should fill the orphan "Address" into the empty header.
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            page_h,
+            RegionCoordSpace::Standard,
+        );
+        assert_eq!(cells[0].text, "Address");
+        // Data rows must NOT have been augmented (already filled by stage 1).
+        assert!(!cells[1].text.contains("Address"));
+        assert!(!cells[2].text.contains("Address"));
+    }
+
+    #[test]
+    fn stage2_recovers_y_shifted_col0_in_consecutive_rows() {
+        // Symptom B reproduction: a stretch of rows where col 0 cell bboxes
+        // sit just above the actual branch-name text. After stage 1 those
+        // cells are empty; stage 2 should pull the orphan items in by
+        // y-proximity.
+        //
+        // page_height=800. Cells are 14pt tall in top-left; flipped native
+        // bounds are [240,254], [220,234], [200,214]. Items sit ~1pt below
+        // each cell's native y range (still within ~1pt of the edge), so
+        // both center-containment and 60% overlap fail in stage 1.
+        use crate::tables::StructuredCell;
+        let items = vec![
+            // Bellevue: native y=235, center 239 — just below row 0's
+            // cell native bottom (240). Closer to row 0 than row 1.
+            test_item("Bellevue", 30.0, 235.0, 45.0, 8.0),
+            // Glenwood: native y=215, center 219 — just below row 1.
+            test_item("Glenwood", 30.0, 215.0, 45.0, 8.0),
+            // Metro Crossing: native y=195, center 199 — just below row 2.
+            test_item("Metro Crossing", 30.0, 195.0, 70.0, 8.0),
+        ];
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 546.0, 200.0, 560.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 566.0, 200.0, 580.0],
+            },
+            StructuredCell {
+                row: 2,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [10.0, 586.0, 200.0, 600.0],
+            },
+        ];
+        let page_h = 800.0;
+
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for cell in &mut cells {
+            let [x1, y1, x2, y2] = cell.page_pt_bbox;
+            let bounds = region_bounds(x1, y1, x2, y2, page_h, RegionCoordSpace::Standard);
+            let mut matched: Vec<TextItem> = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                if tsr_region_contains_item(item, bounds) {
+                    claimed.insert(i);
+                    matched.push(item.clone());
+                }
+            }
+            cell.text = collect_text_from_matched_items(matched, 0.10).replace(['\n', '\r'], " ");
+        }
+        // All three cells empty after stage 1 (text falls just below each).
+        for c in &cells {
+            assert!(
+                c.text.is_empty(),
+                "stage 1 should leave all cells empty: {:?}",
+                c
+            );
+        }
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            page_h,
+            RegionCoordSpace::Standard,
+        );
+        assert_eq!(cells[0].text, "Bellevue");
+        assert_eq!(cells[1].text, "Glenwood");
+        assert_eq!(cells[2].text, "Metro Crossing");
+    }
+
+    #[test]
+    fn stage2_does_not_overwrite_filled_cells_or_admit_far_orphans() {
+        // Stage 2 must only fill EMPTY cells (preserves stage 1's strict
+        // behavior on bleed cases) and must reject orphans that fall far
+        // outside any cell (prevents pulling a figure title into a table).
+        use crate::tables::StructuredCell;
+        let items = vec![
+            test_item("Real", 50.0, 100.0, 30.0, 8.0),
+            // Far orphan — at native y=20 (page bottom edge) on a page where
+            // the table sits around native y=92..104 (top-left y=96..108).
+            // y-distance to nearest cell is ~70pt, far exceeding the ~12pt
+            // cap from median row height.
+            test_item("FigureTitle", 50.0, 20.0, 60.0, 8.0),
+        ];
+        let mut cells = vec![
+            StructuredCell {
+                row: 0,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: String::new(),
+                page_pt_bbox: [40.0, 96.0, 100.0, 108.0],
+            },
+            StructuredCell {
+                row: 1,
+                col: 0,
+                rowspan: 1,
+                colspan: 1,
+                is_header: false,
+                text: "Pre-filled".to_string(),
+                page_pt_bbox: [40.0, 116.0, 100.0, 128.0],
+            },
+        ];
+        let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Pretend "Real" got claimed by a different cell (won't be re-assigned).
+        // Don't claim "FigureTitle" — it's the far orphan.
+        claimed.insert(0);
+
+        tsr_assign_orphan_items(
+            &items,
+            &mut cells,
+            &claimed,
+            200.0,
+            RegionCoordSpace::Standard,
+        );
+        // Empty cell stayed empty (orphan was too far).
+        assert_eq!(cells[0].text, "");
+        // Pre-filled cell was not touched.
+        assert_eq!(cells[1].text, "Pre-filled");
     }
 }
