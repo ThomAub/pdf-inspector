@@ -1430,28 +1430,131 @@ fn tsr_region_contains_item(item: &TextItem, bounds: RegionBounds) -> bool {
 /// `Document::load_metadata` for page count + `Document::load` for content
 /// are combined here, but lopdf loads the full doc in `load()` so we extract
 /// page count from it directly to avoid the metadata-only round-trip.
-fn load_document_from_path<P: AsRef<Path>>(path: P) -> Result<(Document, u32), PdfError> {
+pub(crate) fn load_document_from_path<P: AsRef<Path>>(
+    path: P,
+) -> Result<(Document, u32), PdfError> {
     let buffer = std::fs::read(&path)?;
     load_document_from_mem(&buffer)
 }
 
 /// Load a PDF from a memory buffer.
-fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
+pub(crate) fn load_document_from_mem(buffer: &[u8]) -> Result<(Document, u32), PdfError> {
     // Fix malformed struct element names before parsing. Some PDF generators
     // write bare names (/S Code) instead of proper PDF names (/S /Code), which
     // causes lopdf to silently drop the entire object.
     let fixed = structure_tree::fix_bare_struct_names(buffer);
     let buf = fixed.as_ref();
 
-    let doc = match Document::load_mem(buf) {
-        Ok(d) => d,
-        Err(ref e) if is_encrypted_lopdf_error(e) => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))?
+    let doc = match load_document_bytes(buf) {
+        Ok(doc) => doc,
+        Err(first_err) => {
+            for repaired in repair_pdf_container_candidates(buf) {
+                match load_document_bytes(&repaired) {
+                    Ok(doc) => {
+                        log::debug!("loaded PDF after repairing malformed container bytes");
+                        let page_count = doc.get_pages().len() as u32;
+                        return Ok((doc, page_count));
+                    }
+                    Err(e) => {
+                        if is_encrypted_lopdf_error(&e) {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            }
+            return Err(first_err.into());
         }
-        Err(e) => return Err(e.into()),
     };
     let page_count = doc.get_pages().len() as u32;
     Ok((doc, page_count))
+}
+
+fn load_document_bytes(buf: &[u8]) -> Result<Document, lopdf::Error> {
+    match Document::load_mem(buf) {
+        Ok(doc) => Ok(doc),
+        Err(ref e) if is_encrypted_lopdf_error(e) => {
+            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn repair_pdf_container_candidates(buf: &[u8]) -> Vec<Vec<u8>> {
+    let mut candidates = Vec::new();
+
+    add_repair_candidate(&mut candidates, append_missing_eof_marker(buf), buf);
+
+    let stripped = strip_leading_pdf_container_bytes(buf);
+    if let Some(stripped_buf) = stripped.as_deref() {
+        add_repair_candidate(&mut candidates, Some(stripped_buf.to_vec()), buf);
+        add_repair_candidate(
+            &mut candidates,
+            append_missing_eof_marker(stripped_buf),
+            buf,
+        );
+    }
+
+    candidates
+}
+
+fn add_repair_candidate(
+    candidates: &mut Vec<Vec<u8>>,
+    candidate: Option<Vec<u8>>,
+    original: &[u8],
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if candidate.as_slice() == original {
+        return;
+    }
+    if candidates.iter().any(|existing| existing == &candidate) {
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn append_missing_eof_marker(buf: &[u8]) -> Option<Vec<u8>> {
+    if contains_recent_eof_marker(buf) {
+        return None;
+    }
+
+    let mut end = buf.len();
+    while end > 0 && buf[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+
+    if !buf[..end].ends_with(b"%%EO") {
+        return None;
+    }
+
+    let mut repaired = Vec::with_capacity(end + 2);
+    repaired.extend_from_slice(&buf[..end]);
+    repaired.extend_from_slice(b"F\n");
+    Some(repaired)
+}
+
+fn contains_recent_eof_marker(buf: &[u8]) -> bool {
+    let start = buf.len().saturating_sub(1024);
+    buf[start..].windows(b"%%EOF".len()).any(|w| w == b"%%EOF")
+}
+
+fn strip_leading_pdf_container_bytes(buf: &[u8]) -> Option<Vec<u8>> {
+    let mut start = if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+
+    while start < buf.len() && buf[start].is_ascii_whitespace() {
+        start += 1;
+    }
+
+    if start > 0 && buf[start..].starts_with(b"%PDF-") {
+        Some(buf[start..].to_vec())
+    } else {
+        None
+    }
 }
 
 /// Core processing pipeline operating on a pre-loaded document.

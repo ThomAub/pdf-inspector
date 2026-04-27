@@ -1,6 +1,6 @@
 //! Integration tests for pdf-to-markdown library
 
-use pdf_inspector::detector::{DetectionConfig, ScanStrategy};
+use pdf_inspector::detector::{estimate_page_count_from_bytes, DetectionConfig, ScanStrategy};
 use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
@@ -10,6 +10,83 @@ use pdf_inspector::{
     MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 use std::collections::HashSet;
+
+fn make_minimal_text_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    );
+
+    let content = "BT /F1 12 Tf 100 700 Td (Hello World) Tj 0 -14 Td (Second Line) Tj 0 -14 Td (Third Line) Tj ET";
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+fn truncate_eof_marker(mut pdf: Vec<u8>) -> Vec<u8> {
+    assert!(pdf.ends_with(b"%%EOF"));
+    pdf.pop();
+    pdf
+}
+
+fn add_leading_tab(mut pdf: Vec<u8>) -> Vec<u8> {
+    pdf.insert(0, b'\t');
+    pdf
+}
 
 // Helper to create test TextItems
 fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> TextItem {
@@ -824,6 +901,73 @@ fn test_bom_prefixed_pdf_header_not_rejected() {
         }
         _ => {} // Parse or InvalidStructure is fine
     }
+}
+
+#[test]
+fn test_process_pdf_mem_repairs_truncated_eof_marker() {
+    let pdf = truncate_eof_marker(make_minimal_text_pdf());
+
+    let result = process_pdf_mem(&pdf).expect("truncated %%EO marker should be repaired");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert_eq!(result.page_count, 1);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "repaired PDF should still extract text"
+    );
+}
+
+#[test]
+fn test_process_pdf_mem_repairs_leading_tab_and_truncated_eof() {
+    let pdf = add_leading_tab(truncate_eof_marker(make_minimal_text_pdf()));
+
+    let result = process_pdf_mem(&pdf).expect("leading whitespace + %%EO should be repaired");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert_eq!(result.page_count, 1);
+    assert!(
+        result
+            .markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Hello World"),
+        "repaired PDF should still extract text"
+    );
+}
+
+#[test]
+fn test_detect_pdf_type_repairs_container_from_path() {
+    let pdf = add_leading_tab(truncate_eof_marker(make_minimal_text_pdf()));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("broken-container.pdf");
+    std::fs::write(&path, pdf).unwrap();
+
+    let result = detect_pdf_type(&path).expect("detector should use shared repair loader");
+
+    assert_eq!(result.pdf_type, PdfType::TextBased);
+    assert_eq!(result.page_count, 1);
+    assert_eq!(result.pages_with_text, 1);
+}
+
+#[test]
+fn test_extract_text_mem_uses_container_repair() {
+    let pdf = truncate_eof_marker(make_minimal_text_pdf());
+
+    let text = pdf_inspector::extractor::extract_text_mem(&pdf)
+        .expect("plain text extraction should use shared repair loader");
+
+    assert!(text.contains("Hello World"));
+}
+
+#[test]
+fn test_estimate_page_count_from_bytes_excludes_pages_tree() {
+    let pdf = add_leading_tab(truncate_eof_marker(make_minimal_text_pdf()));
+
+    assert_eq!(estimate_page_count_from_bytes(&pdf), 1);
 }
 
 #[test]
